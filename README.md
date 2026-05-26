@@ -32,6 +32,70 @@ capture (channel **K8B**, YTN DMB, 183.008 MHz, EId `0xE040`).
 | `dab-iq`         | Airspy / RTL-SDR I/Q input (libairspy FFI)                       | planned     |
 | `dab-cli`        | Binary front-end (`dab`)                                         | **Week 1**  |
 
+## Roadmap
+
+Built bottom-up: every stage is validated against a reference before the next
+is layered on top. The validation oracle is the C++
+[`eti-stuff`](https://github.com/JvanKatwijk/eti-stuff) decoder (byte-identical
+target); Week 1 additionally reproduces the Python
+[`airspy-mini-dmb`](https://github.com/zobithecat/airspy-mini-dmb) receiver.
+
+**Done**
+
+- ✅ **Week 1 — Outer FEC & ETI plumbing.** `dab-eti` (ETI(NI) frame parser),
+  `dab-msc` (sub-channel extraction), `dab-fec` (sync-aligned Forney
+  deinterleaver + RS(204,188)), `dab-cli` (`dab fec`). Validated byte-identical
+  against the Python receiver — 87.3 % RS on the K8B capture, sync lock at
+  phase 160.
+- ✅ **Week 2 — Inner FEC.** `dab-viterbi` (rate-1/4 K=7 Viterbi + EEP
+  depuncturing) and `dab-descramble` (energy-dispersal PRBS), ported from
+  `eti-stuff`. Covered by self-contained round-trip tests; the byte-identical
+  cross-check against `eti-stuff` is deferred until OFDM soft bits exist.
+
+**Next**
+
+- ⬜ **`dab-fic` — FIC decode.** FIB CRC-16; FIG 0/0, 0/1, 0/2, 0/14 and 1/x
+  dispatch → Ensemble. Closes Stage A end-to-end: emit the ensemble label
+  *"YTN DMB"* (EId 0xE040) and its 5 services. (Scoped to Week 1; carried
+  forward.)
+- ⬜ **Weeks 3-5 — `dab-ofdm` (the core contribution).** Mode I demodulator,
+  built and validated one stage at a time:
+  1. Resample 3 → 2.048 MSPS (polyphase)
+  2. Coarse time sync (null-symbol envelope dip)
+  3. Fine time + fractional frequency offset (cyclic-prefix autocorrelation)
+  4. Frequency correction (NCO)
+  5. 2048-point FFT (`rustfft`)
+  6. Channel equalisation against the phase-reference symbol
+  7. π/4-DQPSK demap → soft bits (`+ ⇒ bit 1`; see *Discovered subtleties*)
+
+  Reaching step 7 unblocks the deferred full-chain validation: the same raw
+  I/Q into both `eti-stuff` and `dab-rs`, compared per OFDM symbol and
+  end-to-end on the K8B capture.
+- ⬜ **`dab-iq` — SDR input.** Airspy / RTL-SDR I/Q via `libairspy` (bindgen
+  FFI); see the Airspy 12-bit note in *Discovered subtleties*.
+
+**Later**
+
+- ⬜ **Week 6 — Performance margin.** SNR-threshold tuning vs `eti-stuff`,
+  lock-time optimisation, `criterion` benchmarks (throughput, latency, memory).
+- ⬜ **Week 7 — WebAssembly.** `wasm-pack` build; decode the K8B capture (or a
+  smaller sample) in-browser; live demo page.
+- ⬜ **Week 8 — Paper.** Target SoftwareX / JOSS / IEEE BMSB —
+  *"dab-ofdm-rs: A Memory-Safe Software-Defined DAB Mode I Demodulator in Rust
+  with WebAssembly Deployment."*
+
+### Validation status
+
+| Stage | Scope                              | Oracle                              | Status                                            |
+| ----- | ---------------------------------- | ----------------------------------- | ------------------------------------------------- |
+| A     | Outer FEC + ETI/MSC                | Python `airspy-mini-dmb` + `.eti`   | ✅ byte-identical (87.3 % RS)                      |
+| B     | Inner FEC (Viterbi + descramble)   | `eti-stuff` intermediate dump       | ⬜ deferred — needs raw I/Q or OFDM soft bits     |
+| C     | OFDM core                          | `eti-stuff` per-symbol dump         | ⬜ blocked on `dab-ofdm` + raw I/Q                |
+
+> Stage B/C cross-validation needs a raw I/Q capture (`airspy_rx -r out.iq`)
+> and a built/instrumented `eti-stuff`. The committed `.eti` files are
+> *downstream* of these stages, so they cannot serve as their input.
+
 ## DAB Mode I parameters
 
 | Parameter        | Value                                            |
