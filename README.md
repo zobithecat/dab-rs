@@ -44,6 +44,32 @@ capture (channel **K8B**, YTN DMB, 183.008 MHz, EId `0xE040`).
 | Inner FEC        | rate-1/4 conv, K=7, polys (0o133,0o171,0o145,0o133)|
 | Outer FEC (T-DMB)| RS(204,188) DVB params + Forney TI (N=12, M=17)   |
 
+## Discovered subtleties
+
+Implementation notes that bit us during the port and that the next
+contributor (or the next paper reviewer) deserves to know up front.
+
+- **Viterbi soft-bit polarity convention** *(Week 2, `dab-viterbi`).*
+  A comment in `eti-stuff`'s `viterbi-handler.cpp` suggests that a
+  soft-bit value of `+255` decodes to bit `0`. Tracing the trellis
+  metric updates shows the opposite: `+255` corresponds to bit `1`.
+  The decoder is a verbatim port of the C++, so it inherits the
+  *actual* behaviour, not the commented one. The OFDM demapper in
+  Week 3 (`dab-ofdm`, π/4-DQPSK → soft bits) must emit soft values
+  under this same `+ ⇒ 1` convention, otherwise the inner decoder
+  silently produces inverted bytes.
+
+- **Forney deinterleaver sync alignment** *(Week 1, `dab-fec`).*
+  The deinterleaver must be aligned to the TS sync byte (`0x47`)
+  *before* it processes any data, not after. The naive
+  ``deinterleave then search for 0x47'' ordering happens to preserve
+  the 204-byte sync cadence by coincidence (since `204 = N · M`), so
+  the downstream sync scan looks fine but every byte is permuted to
+  the wrong slot. On the reference K8B capture this drops RS from
+  87.3 % to 0 %. See `crates/dab-fec/src/outer.rs` and the companion
+  [`airspy-mini-dmb`](https://github.com/zobithecat/airspy-mini-dmb)
+  paper for the detailed before/after.
+
 ## Build & test
 
 Requires Rust stable (1.83+). On macOS:
