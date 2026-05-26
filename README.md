@@ -26,8 +26,8 @@ capture (channel **K8B**, YTN DMB, 183.008 MHz, EId `0xE040`).
 | `dab-eti`        | ETI(NI, G.703) frame parser (ETSI EN 300 799)                    | **Week 1**  |
 | `dab-msc`        | MSC sub-channel byte extraction                                  | **Week 1**  |
 | `dab-fic`        | FIC: FIB CRC, FIG 0/x & 1/x → Ensemble                           | planned     |
-| `dab-viterbi`    | Rate-1/4 punctured convolutional (Viterbi) inner decoder         | planned     |
-| `dab-descramble` | Energy-dispersal PRBS (x⁹ + x⁵ + 1)                              | planned     |
+| `dab-viterbi`    | Rate-1/4 punctured convolutional (Viterbi) inner decoder + EEP   | **Week 2**  |
+| `dab-descramble` | Energy-dispersal PRBS (x⁹ + x⁵ + 1)                              | **Week 2**  |
 | `dab-ofdm`       | **Mode I OFDM demodulator (main contribution)**                  | planned     |
 | `dab-iq`         | Airspy / RTL-SDR I/Q input (libairspy FFI)                       | planned     |
 | `dab-cli`        | Binary front-end (`dab`)                                         | **Week 1**  |
