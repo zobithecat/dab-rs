@@ -70,6 +70,19 @@ contributor (or the next paper reviewer) deserves to know up front.
   [`airspy-mini-dmb`](https://github.com/zobithecat/airspy-mini-dmb)
   paper for the detailed before/after.
 
+- **Airspy 12-bit packed sample format** *(planned, `dab-iq`).*
+  The Airspy Mini's native USB output packs 12-bit ADC samples
+  across pairs of 16-bit words rather than emitting them as
+  zero-extended signed-16 — i.e. raw USB bytes are not
+  `Complex<i16>` even though that is what most receivers expect.
+  `libairspy` unpacks transparently and exposes `Complex<i16>` or
+  `Complex<f32>` to callers, which is why `dab-iq-airspy` (Week 4+)
+  will go through `libairspy` via bindgen rather than talking to
+  `libusb` directly. A pure-Rust libusb path would have to
+  re-derive the unpacking, the firmware-level gain-stage command
+  protocol (LNA / Mixer / VGA), and the bias-tee toggle — solvable
+  but a substantial extra surface for marginal benefit.
+
 ## Build & test
 
 Requires Rust stable (1.83+). On macOS:
