@@ -1,0 +1,18 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Reference captures / large data (linked, not committed)
+*.eti
+*.iq
+*.raw
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# OMC orchestration state / local agent config (not part of the public repo)
+.omc/
+.claude/
+tasks.md

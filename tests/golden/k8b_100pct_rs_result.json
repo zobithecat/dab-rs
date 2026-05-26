@@ -1,0 +1,22 @@
+{
+  "_comment": "Golden outer-FEC result for data/captures/k8b_100pct.eti (SubCh 1), produced by the reference Python receiver airspy-mini-dmb (tools/verify_outer_fec.py). dab-rs must reproduce these byte-for-byte. The 30 MB .eti is not committed; set DAB_RS_K8B_ETI to a local copy.",
+  "source_capture": "k8b_100pct.eti",
+  "subch": 1,
+  "ensemble": { "id": "0xE040", "label": "YTN DMB" },
+  "bytes_in": 5296896,
+  "aligned": true,
+  "phase_offset": 160,
+  "rs_total": 25953,
+  "rs_ok_or_corrected": 22652,
+  "rs_failed": 3301,
+  "rs_success_rate_pct": 87.3,
+  "rs_bytes_corrected": 142822,
+  "top_pids_post_rs": {
+    "0x0113": 16397,
+    "0x0114": 4916,
+    "0x1fff": 457,
+    "0x0000": 226,
+    "0x0111": 224,
+    "0x0112": 220
+  }
+}

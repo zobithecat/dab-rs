@@ -1,0 +1,11 @@
+[package]
+name = "dab-fic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FIC: FIB CRC-16, FIG 0/x and 1/x dispatch -> Ensemble. Roadmap: Week 1."
+
+[dependencies]

@@ -1,0 +1,12 @@
+[package]
+name = "dab-eti"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ETI(NI, G.703) frame parser (ETSI EN 300 799)."
+
+[dependencies]
+thiserror.workspace = true

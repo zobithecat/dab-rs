@@ -1,0 +1,12 @@
+[package]
+name = "dab-msc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MSC sub-channel byte extraction from ETI frames."
+
+[dependencies]
+dab-eti.workspace = true

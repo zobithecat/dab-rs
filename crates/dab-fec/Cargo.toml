@@ -1,0 +1,16 @@
+[package]
+name = "dab-fec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Korean T-DMB outer FEC: sync-aligned Forney deinterleaver + RS(204,188) (ETSI TS 102 427)."
+
+[dependencies]
+reed-solomon.workspace = true
+
+[dev-dependencies]
+dab-eti.workspace = true
+dab-msc.workspace = true

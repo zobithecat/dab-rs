@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dab-iq",
+    "crates/dab-ofdm",
+    "crates/dab-viterbi",
+    "crates/dab-descramble",
+    "crates/dab-fic",
+    "crates/dab-msc",
+    "crates/dab-fec",
+    "crates/dab-eti",
+    "crates/dab-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+authors = ["Seonggeun Yoo <orcogre@vendit.co.kr>"]
+license = "MIT"
+repository = "https://github.com/zobithecat/dab-rs"
+description = "Memory-safe DAB Mode I OFDM demodulator and T-DMB receiver in pure Rust"
+
+[workspace.dependencies]
+# Internal crates
+dab-iq = { path = "crates/dab-iq" }
+dab-ofdm = { path = "crates/dab-ofdm" }
+dab-viterbi = { path = "crates/dab-viterbi" }
+dab-descramble = { path = "crates/dab-descramble" }
+dab-fic = { path = "crates/dab-fic" }
+dab-msc = { path = "crates/dab-msc" }
+dab-fec = { path = "crates/dab-fec" }
+dab-eti = { path = "crates/dab-eti" }
+
+# Shared third-party (see tasks roadmap)
+reed-solomon = "0.2"          # classic RS(204,188) GF(2^8), shares lineage with reedsolo
+crc = "3"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

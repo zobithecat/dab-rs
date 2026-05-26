@@ -1,0 +1,11 @@
+[package]
+name = "dab-descramble"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Energy-dispersal PRBS descrambler (x^9 + x^5 + 1). Roadmap: Week 2."
+
+[dependencies]

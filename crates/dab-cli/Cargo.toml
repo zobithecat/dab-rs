@@ -1,0 +1,22 @@
+[package]
+name = "dab-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "dab-rs CLI: I/Q -> ETI / FIC / MSC decode."
+
+[[bin]]
+name = "dab"
+path = "src/main.rs"
+
+[dependencies]
+dab-eti.workspace = true
+dab-msc.workspace = true
+dab-fec.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
