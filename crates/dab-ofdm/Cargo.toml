@@ -9,3 +9,5 @@ repository.workspace = true
 description = "DAB Mode I OFDM demodulator — main contribution. Roadmap: Week 3-5."
 
 [dependencies]
+rustfft.workspace = true
+num-complex.workspace = true

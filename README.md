@@ -28,7 +28,7 @@ capture (channel **K8B**, YTN DMB, 183.008 MHz, EId `0xE040`).
 | `dab-fic`        | FIC: FIB CRC, FIG 0/x & 1/x → Ensemble                           | **done**    |
 | `dab-viterbi`    | Rate-1/4 punctured convolutional (Viterbi) inner decoder + EEP   | **Week 2**  |
 | `dab-descramble` | Energy-dispersal PRBS (x⁹ + x⁵ + 1)                              | **Week 2**  |
-| `dab-ofdm`       | **Mode I OFDM demodulator (main contribution)**                  | planned     |
+| `dab-ofdm`       | **Mode I OFDM demodulator (main contribution)**                  | in progress |
 | `dab-iq`         | Airspy / RTL-SDR I/Q input (libairspy FFI)                       | planned     |
 | `dab-cli`        | Binary front-end (`dab`)                                         | **Week 1**  |
 
@@ -58,19 +58,26 @@ target); Week 1 additionally reproduces the Python
 
 **Next**
 
-- ⬜ **Weeks 3-5 — `dab-ofdm` (the core contribution).** Mode I demodulator,
+- 🔨 **Weeks 3-5 — `dab-ofdm` (the core contribution).** Mode I demodulator,
   built and validated one stage at a time:
-  1. Resample 3 → 2.048 MSPS (polyphase)
-  2. Coarse time sync (null-symbol envelope dip)
-  3. Fine time + fractional frequency offset (cyclic-prefix autocorrelation)
-  4. Frequency correction (NCO)
-  5. 2048-point FFT (`rustfft`)
-  6. Channel equalisation against the phase-reference symbol
-  7. π/4-DQPSK demap → soft bits (`+ ⇒ bit 1`; see *Discovered subtleties*)
+  - ✅ **Static foundation** — Mode I parameters, the `get_phi` phase table,
+    the Phase-Reference Symbol (PRS), the frequency-interleaver permutation,
+    and an FFT wrapper. Input-independent and deterministic, so verified
+    directly against `eti-stuff` (e.g. the interleaver is proven a bijection
+    onto {−768..−1}∪{1..768}).
+  - ⬜ The 7-stage sync/demod chain (next):
+    1. Resample 3 → 2.048 MSPS (polyphase)
+    2. Coarse time sync (null-symbol envelope dip)
+    3. Fine time + fractional frequency offset (cyclic-prefix autocorrelation)
+    4. Frequency correction (NCO)
+    5. 2048-point FFT (`rustfft`)
+    6. Channel equalisation against the phase-reference symbol
+    7. π/4-DQPSK demap → soft bits (`+ ⇒ bit 1`; see *Discovered subtleties*)
 
   Reaching step 7 unblocks the deferred full-chain validation: the same raw
   I/Q into both `eti-stuff` and `dab-rs`, compared per OFDM symbol and
-  end-to-end on the K8B capture.
+  end-to-end on the K8B capture. **This needs a raw I/Q capture, which does
+  not yet exist** (see the validation note below).
 - ⬜ **`dab-iq` — SDR input.** Airspy / RTL-SDR I/Q via `libairspy` (bindgen
   FFI); see the Airspy 12-bit note in *Discovered subtleties*.
 

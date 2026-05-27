@@ -33,6 +33,8 @@ dab-fec = { path = "crates/dab-fec" }
 dab-eti = { path = "crates/dab-eti" }
 
 # Shared third-party (see tasks roadmap)
+rustfft = "6"                 # SIMD FFT for the OFDM core
+num-complex = "0.4"
 reed-solomon = "0.2"          # classic RS(204,188) GF(2^8), shares lineage with reedsolo
 crc = "3"
 thiserror = "2"
