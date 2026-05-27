@@ -25,7 +25,7 @@ capture (channel **K8B**, YTN DMB, 183.008 MHz, EId `0xE040`).
 | `dab-fec`        | T-DMB outer FEC: sync-aligned Forney deinterleaver + RS(204,188) | **Week 1**  |
 | `dab-eti`        | ETI(NI, G.703) frame parser (ETSI EN 300 799)                    | **Week 1**  |
 | `dab-msc`        | MSC sub-channel byte extraction                                  | **Week 1**  |
-| `dab-fic`        | FIC: FIB CRC, FIG 0/x & 1/x → Ensemble                           | planned     |
+| `dab-fic`        | FIC: FIB CRC, FIG 0/x & 1/x → Ensemble                           | **done**    |
 | `dab-viterbi`    | Rate-1/4 punctured convolutional (Viterbi) inner decoder + EEP   | **Week 2**  |
 | `dab-descramble` | Energy-dispersal PRBS (x⁹ + x⁵ + 1)                              | **Week 2**  |
 | `dab-ofdm`       | **Mode I OFDM demodulator (main contribution)**                  | planned     |
@@ -51,13 +51,13 @@ target); Week 1 additionally reproduces the Python
   depuncturing) and `dab-descramble` (energy-dispersal PRBS), ported from
   `eti-stuff`. Covered by self-contained round-trip tests; the byte-identical
   cross-check against `eti-stuff` is deferred until OFDM soft bits exist.
+- ✅ **`dab-fic` — FIC decode.** FIB CRC-16; FIG 0/0, 0/1, 0/2 and 1/0,1/1,1/5
+  dispatch → Ensemble. Closes Stage A end-to-end: byte-identical against the
+  Python reference on the K8B capture — ensemble label *"YTN DMB"* (EId 0xE040),
+  4 sub-channels, 5 services, fib_ok 15042/20064. Try `dab fic <capture.eti>`.
 
 **Next**
 
-- ⬜ **`dab-fic` — FIC decode.** FIB CRC-16; FIG 0/0, 0/1, 0/2, 0/14 and 1/x
-  dispatch → Ensemble. Closes Stage A end-to-end: emit the ensemble label
-  *"YTN DMB"* (EId 0xE040) and its 5 services. (Scoped to Week 1; carried
-  forward.)
 - ⬜ **Weeks 3-5 — `dab-ofdm` (the core contribution).** Mode I demodulator,
   built and validated one stage at a time:
   1. Resample 3 → 2.048 MSPS (polyphase)
@@ -88,7 +88,7 @@ target); Week 1 additionally reproduces the Python
 
 | Stage | Scope                              | Oracle                              | Status                                            |
 | ----- | ---------------------------------- | ----------------------------------- | ------------------------------------------------- |
-| A     | Outer FEC + ETI/MSC                | Python `airspy-mini-dmb` + `.eti`   | ✅ byte-identical (87.3 % RS)                      |
+| A     | Outer FEC + ETI/MSC + FIC          | Python `airspy-mini-dmb` + `.eti`   | ✅ byte-identical (87.3 % RS; ensemble "YTN DMB") |
 | B     | Inner FEC (Viterbi + descramble)   | `eti-stuff` intermediate dump       | ⬜ deferred — needs raw I/Q or OFDM soft bits     |
 | C     | OFDM core                          | `eti-stuff` per-symbol dump         | ⬜ blocked on `dab-ofdm` + raw I/Q                |
 

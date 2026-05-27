@@ -118,6 +118,7 @@ dependencies = [
  "clap",
  "dab-eti",
  "dab-fec",
+ "dab-fic",
  "dab-msc",
  "tracing",
  "tracing-subscriber",
@@ -146,6 +147,9 @@ dependencies = [
 [[package]]
 name = "dab-fic"
 version = "0.1.0"
+dependencies = [
+ "dab-eti",
+]
 
 [[package]]
 name = "dab-iq"

@@ -26,6 +26,12 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         subch: u8,
     },
+    /// Decode the FIC of an ETI(NI) capture and print the ensemble
+    /// configuration (EId, label, sub-channels, services).
+    Fic {
+        /// Path to an ETI(NI) capture (6144-byte frames).
+        eti: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -33,7 +39,67 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Fec { eti, subch } => run_fec(&eti, subch),
+        Command::Fic { eti } => run_fic(&eti),
     }
+}
+
+fn run_fic(eti: &std::path::Path) -> Result<()> {
+    let bytes = std::fs::read(eti)?;
+    let mut acc = dab_fic::FicAccumulator::new();
+    for frame in dab_eti::FrameReader::new(&bytes) {
+        let frame = match frame {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if !frame.fic.is_empty() {
+            acc.feed_fic(&frame.fic);
+        }
+    }
+
+    println!("fib_ok={}/{}", acc.fib_ok, acc.fib_total);
+    let ens = &acc.ensemble;
+    match ens.eid {
+        Some(eid) => println!("EId=0x{eid:04X}"),
+        None => println!("EId=(none)"),
+    }
+    println!("label={:?}", ens.label);
+
+    println!("sub-channels ({}):", ens.sub_channels.len());
+    for sc in ens.sub_channels.values() {
+        println!(
+            "  sub {:>2}: start={:>3} size={:>3}cu {} {}kbps {}",
+            sc.sub_ch_id,
+            sc.start_addr,
+            sc.size_cu,
+            sc.protection,
+            sc.bitrate_kbps,
+            if sc.is_long_form { "long" } else { "short" },
+        );
+    }
+
+    println!("services ({}):", ens.services.len());
+    for svc in ens.services.values() {
+        println!(
+            "  SId=0x{:08X} {} label={:?}",
+            svc.sid,
+            if svc.is_data { "data" } else { "prog" },
+            svc.label,
+        );
+        for c in &svc.components {
+            let sub = match c.sub_ch_id {
+                Some(s) => format!("sub {s}"),
+                None => format!("SCIdS {}", c.sc_id_s),
+            };
+            println!(
+                "    [{}] {} ty={}{}",
+                c.transport,
+                sub,
+                c.ascty_or_dscty,
+                if c.is_primary { " primary" } else { "" },
+            );
+        }
+    }
+    Ok(())
 }
 
 fn run_fec(eti: &std::path::Path, subch: u8) -> Result<()> {

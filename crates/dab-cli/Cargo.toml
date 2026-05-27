@@ -16,6 +16,7 @@ path = "src/main.rs"
 dab-eti.workspace = true
 dab-msc.workspace = true
 dab-fec.workspace = true
+dab-fic.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
