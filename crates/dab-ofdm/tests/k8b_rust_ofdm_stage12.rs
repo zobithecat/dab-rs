@@ -1,11 +1,13 @@
-//! Week 3a golden integration test: OFDM sync chain stages 1-2 on the real
-//! K8B raw I/Q capture.
+//! Golden integration test: OFDM sync chain stages 1-3 on the real K8B raw
+//! I/Q capture.
 //!
 //! Pipeline: dab-iq reads `k8b_rust.iq` (INT16_IQ @ 3 MSPS) -> Stage 1
 //! polyphase resample 3 -> 2.048 MSPS -> Stage 2 adaptive null-symbol
-//! detection. Cross-checked against the Python reference
-//! `airspy-mini-dmb/tools/iq_validate_dab.py`, whose `gate_null` found
-//! 209 dips / 207 at the 96.00 ms DAB Mode I null cadence on the same file.
+//! detection -> Stage 3 CP-autocorrelation fine timing + fractional CFO.
+//! Cross-checked against the Python reference
+//! `airspy-mini-dmb/tools/iq_validate_dab.py`: `gate_null` found 207/209
+//! dips at the 96.00 ms DAB null cadence, and `gate_cp_autocorr` reported
+//! 98% CP lock over 50 symbol periods on the same file.
 //!
 //! The 240 MB capture is Git-LFS / not committed here. Provide a local copy:
 //!   export DAB_RS_K8B_IQ=/path/to/k8b_rust.iq
@@ -15,7 +17,7 @@
 use num_complex::Complex;
 
 use dab_iq::{IqFileReader, IqFormat};
-use dab_ofdm::{NullDetector, Resampler};
+use dab_ofdm::{CpSync, NullDetector, Resampler};
 
 const DEFAULT_IQ: &str =
     "/Users/zobithecat/Documents/projects/etc_projects/airspy-mini-dmb/data/captures/k8b_rust.iq";
@@ -85,9 +87,36 @@ fn k8b_rust_resample_and_null_detect() {
         "frame_period {fp} != {FRAME_2048K} (±64); err={fp_err}"
     );
 
+    // Stage 3: CP autocorrelation — fine symbol timing + fractional CFO.
+    // Take a null well past the resampler transient; OFDM symbols begin right
+    // after the ~2656-sample null. lock() scans a 2*Ts span for the symbol
+    // boundary, then checks 50 symbols at +Ts spacing (mirrors the Python
+    // gate_cp_autocorr: frac=0.5, n=50, which reported 98% lock).
+    let cp = CpSync::mode_i();
+    let null_len_2048k = 2656usize;
+    let mid_null = res.positions[res.positions.len() / 2];
+    let scan_start = mid_null + null_len_2048k;
+    let lock = cp.lock(&resampled, scan_start, 50, 0.5);
+    let cfo_hz = cp.estimate_cfo_hz(&resampled, lock.peak_idx, 50);
+
+    assert!(
+        lock.n_locked >= 30,
+        "CP lock too low: {}/{} (Python reference: ~98%)",
+        lock.n_locked,
+        lock.n_tested
+    );
+    assert!(
+        cfo_hz.abs() <= 500.0,
+        "fractional CFO {cfo_hz:.1} Hz outside ±500 Hz (½ carrier spacing)"
+    );
+
     eprintln!(
-        "OK: in={in_count} resampled={} dips={} frame_period={fp} (target {FRAME_2048K})",
+        "OK: in={in_count} resampled={} dips={} frame_period={fp} (target {FRAME_2048K}); \
+         CP lock {}/{} peak_mag={:.3} frac_cfo={cfo_hz:.1}Hz",
         resampled.len(),
         res.positions.len(),
+        lock.n_locked,
+        lock.n_tested,
+        lock.peak_mag,
     );
 }

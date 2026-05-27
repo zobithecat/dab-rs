@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cp_sync;
 pub mod fft;
 pub mod freq_interleaver;
 pub mod null_detect;
@@ -37,6 +38,7 @@ pub mod phasereference;
 pub mod phasetable;
 pub mod resampler;
 
+pub use cp_sync::{CpMetric, CpSync, LockReport};
 pub use fft::Fft;
 pub use freq_interleaver::FreqInterleaver;
 pub use null_detect::{NullDetectResult, NullDetector};

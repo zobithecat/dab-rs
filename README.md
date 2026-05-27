@@ -68,18 +68,19 @@ target); Week 1 additionally reproduces the Python
   - 🔨 The 7-stage sync/demod chain:
     1. ✅ Resample 3 → 2.048 MSPS (polyphase, L/M = 256/375) — `dab-ofdm::Resampler`
     2. ✅ Coarse time sync (null-symbol envelope dip, adaptive threshold) — `dab-ofdm::NullDetector`
-    3. ⬜ Fine time + fractional frequency offset (cyclic-prefix autocorrelation)
-    4. ⬜ Frequency correction (NCO)
+    3. ✅ Fine time + fractional frequency offset (cyclic-prefix autocorrelation) — `dab-ofdm::CpSync`
+    4. ⬜ Frequency correction (NCO) + integer-carrier (coarse) offset via PRS
     5. ⬜ 2048-point FFT (`rustfft`)
     6. ⬜ Channel equalisation against the phase-reference symbol
     7. ⬜ π/4-DQPSK demap → soft bits (`+ ⇒ bit 1`; see *Discovered subtleties*)
 
-  Stages 1-2 are validated on a real 20 s K8B capture (`dab-iq` reads the
+  Stages 1-3 are validated on a real 20 s K8B capture (`dab-iq` reads the
   INT16_IQ @ 3 MSPS file): 60 000 000 → 40 960 000 samples, **210 null dips**
-  recovered at the 96 ms DAB frame cadence (frame period 196 593 ≈ 196 608),
-  matching the Python reference (`tools/iq_validate_dab.py`, 207 dips).
-  Reaching step 7 unblocks full per-symbol cross-validation against
-  `eti-stuff`.
+  at the 96 ms DAB frame cadence (frame period 196 593 ≈ 196 608), and **CP
+  autocorrelation locking 50/50 symbol periods** (peak metric 0.69) with a
+  stable fractional CFO of −367 Hz. Matches the Python reference
+  (`tools/iq_validate_dab.py`: 207 dips, 98% CP lock). Reaching step 7
+  unblocks full per-symbol cross-validation against `eti-stuff`.
 - ✅ **`dab-iq` — file I/Q input.** Reads Cs8 / Cs16Le / Cf32Le with JSON
   sidecar auto-detection; feeds the resampler. (Live `libairspy` SDR capture
   via bindgen FFI is a later add — see the Airspy 12-bit note in *Discovered
@@ -101,7 +102,7 @@ target); Week 1 additionally reproduces the Python
 | ----- | ---------------------------------- | ----------------------------------- | ------------------------------------------------- |
 | A     | Outer FEC + ETI/MSC + FIC          | Python `airspy-mini-dmb` + `.eti`   | ✅ byte-identical (87.3 % RS; ensemble "YTN DMB") |
 | B     | Inner FEC (Viterbi + descramble)   | `eti-stuff` intermediate dump       | ⬜ deferred — needs raw I/Q or OFDM soft bits     |
-| C     | OFDM core                          | K8B raw I/Q + `eti-stuff` per-symbol | 🔨 stages 1-2 validated on real K8B I/Q; 3-7 next |
+| C     | OFDM core                          | K8B raw I/Q + `eti-stuff` per-symbol | 🔨 stages 1-3 validated on real K8B I/Q; 4-7 next |
 
 > A 20 s K8B raw I/Q capture (`k8b_rust.iq`, INT16_IQ @ 3 MSPS, in the
 > `airspy-mini-dmb` repo under Git LFS) now exists and drives the Stage C
