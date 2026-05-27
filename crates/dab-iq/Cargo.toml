@@ -6,6 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Airspy / RTL-SDR I/Q input (libairspy FFI). Roadmap: Week 1+."
+description = "File-based raw I/Q reader (Cs8 / Cs16Le / Cf32Le) with JSON sidecar metadata. Roadmap: Week 3a; libairspy FFI in Week 4+."
 
 [dependencies]
+num-complex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

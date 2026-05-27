@@ -29,7 +29,7 @@ capture (channel **K8B**, YTN DMB, 183.008 MHz, EId `0xE040`).
 | `dab-viterbi`    | Rate-1/4 punctured convolutional (Viterbi) inner decoder + EEP   | **Week 2**  |
 | `dab-descramble` | Energy-dispersal PRBS (x⁹ + x⁵ + 1)                              | **Week 2**  |
 | `dab-ofdm`       | **Mode I OFDM demodulator (main contribution)**                  | in progress |
-| `dab-iq`         | Airspy / RTL-SDR I/Q input (libairspy FFI)                       | planned     |
+| `dab-iq`         | File I/Q reader (Cs8/Cs16Le/Cf32Le + JSON sidecar); libairspy later | **Week 3a** |
 | `dab-cli`        | Binary front-end (`dab`)                                         | **Week 1**  |
 
 ## Roadmap
@@ -65,21 +65,25 @@ target); Week 1 additionally reproduces the Python
     and an FFT wrapper. Input-independent and deterministic, so verified
     directly against `eti-stuff` (e.g. the interleaver is proven a bijection
     onto {−768..−1}∪{1..768}).
-  - ⬜ The 7-stage sync/demod chain (next):
-    1. Resample 3 → 2.048 MSPS (polyphase)
-    2. Coarse time sync (null-symbol envelope dip)
-    3. Fine time + fractional frequency offset (cyclic-prefix autocorrelation)
-    4. Frequency correction (NCO)
-    5. 2048-point FFT (`rustfft`)
-    6. Channel equalisation against the phase-reference symbol
-    7. π/4-DQPSK demap → soft bits (`+ ⇒ bit 1`; see *Discovered subtleties*)
+  - 🔨 The 7-stage sync/demod chain:
+    1. ✅ Resample 3 → 2.048 MSPS (polyphase, L/M = 256/375) — `dab-ofdm::Resampler`
+    2. ✅ Coarse time sync (null-symbol envelope dip, adaptive threshold) — `dab-ofdm::NullDetector`
+    3. ⬜ Fine time + fractional frequency offset (cyclic-prefix autocorrelation)
+    4. ⬜ Frequency correction (NCO)
+    5. ⬜ 2048-point FFT (`rustfft`)
+    6. ⬜ Channel equalisation against the phase-reference symbol
+    7. ⬜ π/4-DQPSK demap → soft bits (`+ ⇒ bit 1`; see *Discovered subtleties*)
 
-  Reaching step 7 unblocks the deferred full-chain validation: the same raw
-  I/Q into both `eti-stuff` and `dab-rs`, compared per OFDM symbol and
-  end-to-end on the K8B capture. **This needs a raw I/Q capture, which does
-  not yet exist** (see the validation note below).
-- ⬜ **`dab-iq` — SDR input.** Airspy / RTL-SDR I/Q via `libairspy` (bindgen
-  FFI); see the Airspy 12-bit note in *Discovered subtleties*.
+  Stages 1-2 are validated on a real 20 s K8B capture (`dab-iq` reads the
+  INT16_IQ @ 3 MSPS file): 60 000 000 → 40 960 000 samples, **210 null dips**
+  recovered at the 96 ms DAB frame cadence (frame period 196 593 ≈ 196 608),
+  matching the Python reference (`tools/iq_validate_dab.py`, 207 dips).
+  Reaching step 7 unblocks full per-symbol cross-validation against
+  `eti-stuff`.
+- ✅ **`dab-iq` — file I/Q input.** Reads Cs8 / Cs16Le / Cf32Le with JSON
+  sidecar auto-detection; feeds the resampler. (Live `libairspy` SDR capture
+  via bindgen FFI is a later add — see the Airspy 12-bit note in *Discovered
+  subtleties*.)
 
 **Later**
 
@@ -97,11 +101,13 @@ target); Week 1 additionally reproduces the Python
 | ----- | ---------------------------------- | ----------------------------------- | ------------------------------------------------- |
 | A     | Outer FEC + ETI/MSC + FIC          | Python `airspy-mini-dmb` + `.eti`   | ✅ byte-identical (87.3 % RS; ensemble "YTN DMB") |
 | B     | Inner FEC (Viterbi + descramble)   | `eti-stuff` intermediate dump       | ⬜ deferred — needs raw I/Q or OFDM soft bits     |
-| C     | OFDM core                          | `eti-stuff` per-symbol dump         | ⬜ blocked on `dab-ofdm` + raw I/Q                |
+| C     | OFDM core                          | K8B raw I/Q + `eti-stuff` per-symbol | 🔨 stages 1-2 validated on real K8B I/Q; 3-7 next |
 
-> Stage B/C cross-validation needs a raw I/Q capture (`airspy_rx -r out.iq`)
-> and a built/instrumented `eti-stuff`. The committed `.eti` files are
-> *downstream* of these stages, so they cannot serve as their input.
+> A 20 s K8B raw I/Q capture (`k8b_rust.iq`, INT16_IQ @ 3 MSPS, in the
+> `airspy-mini-dmb` repo under Git LFS) now exists and drives the Stage C
+> work; the committed `.eti` files are *downstream* of the OFDM/inner-FEC
+> stages, so they cannot serve as input there. Full per-symbol Stage B/C
+> cross-validation additionally needs a built/instrumented `eti-stuff`.
 
 ## DAB Mode I parameters
 
@@ -153,6 +159,20 @@ contributor (or the next paper reviewer) deserves to know up front.
   re-derive the unpacking, the firmware-level gain-stage command
   protocol (LNA / Mixer / VGA), and the bias-tee toggle — solvable
   but a substantial extra surface for marginal benefit.
+
+- **SFN multipath gives shallow null symbols** *(Week 3a, `dab-ofdm`).*
+  The DAB null symbol is meant to be a near-silent gap once per 96 ms
+  frame, and the textbook coarse-sync detector thresholds the envelope
+  at some fixed fraction of its mean (e.g. `0.5 · µ`). In a
+  single-frequency-network metro environment — our K8B capture sees
+  five co-channel transmitters (Namsan / Gwanaksan / Yongmunsan /
+  Gwanggyosan / Unjung) arriving with time skew — the null interval is
+  *filled* by the other transmitters' signals, so the dip is shallow
+  (min/µ ≈ 0.72–0.78, not the textbook 0.1–0.3). A fixed-`µ` threshold
+  silently misses every null. `NullDetector` instead uses an **adaptive
+  threshold** `p1 + 0.30·(p99 − p1)` over the smoothed envelope, which
+  recovers the 96 ms cadence cleanly even at ~7 dB SNR. The shallow-null
+  case is covered by a dedicated unit test.
 
 ## Build & test
 

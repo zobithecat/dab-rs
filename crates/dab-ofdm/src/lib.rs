@@ -31,12 +31,16 @@
 
 pub mod fft;
 pub mod freq_interleaver;
+pub mod null_detect;
 pub mod params;
 pub mod phasereference;
 pub mod phasetable;
+pub mod resampler;
 
 pub use fft::Fft;
 pub use freq_interleaver::FreqInterleaver;
+pub use null_detect::{NullDetectResult, NullDetector};
 pub use params::DabParams;
 pub use phasereference::phase_reference;
 pub use phasetable::get_phi;
+pub use resampler::{resample_3m_to_2048k, Resampler};

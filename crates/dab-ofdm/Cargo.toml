@@ -11,3 +11,6 @@ description = "DAB Mode I OFDM demodulator — main contribution. Roadmap: Week 
 [dependencies]
 rustfft.workspace = true
 num-complex.workspace = true
+
+[dev-dependencies]
+dab-iq.workspace = true
