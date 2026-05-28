@@ -162,6 +162,14 @@ pub fn process_iq_to_fic(
     let mut descrambled_fp: Option<BufWriter<File>> = std::env::var("DAB_RS_DUMP_DESCRAMBLED")
         .ok()
         .and_then(|p| File::create(&p).ok().map(BufWriter::new));
+    // Slice-7 cross-check: per-frame Viterbi *input* (4 ficBlocks × 3096
+    // i16). Header: u32 LE frame_idx. Payload: `4 * 3096 * 2 = 24768`
+    // bytes. Pairs with the patched eti-stuff `DAB_RS_ORACLE_VITERBI_IN`
+    // (which writes per ficBlock; the comparator aggregates 4 oracle
+    // records into one frame to match this layout).
+    let mut viterbi_in_fp: Option<BufWriter<File>> = std::env::var("DAB_RS_DUMP_VITERBI_IN")
+        .ok()
+        .and_then(|p| File::create(&p).ok().map(BufWriter::new));
 
     let p = |z: &Complex<f32>| (z.re as f64).powi(2) + (z.im as f64).powi(2);
 
@@ -271,6 +279,15 @@ pub fn process_iq_to_fic(
             let _ = fp.write_all(&dab_frame_idx.to_le_bytes());
             let _ = fp.write_all(&dumps.descrambled);
         }
+        if let Some(fp) = viterbi_in_fp.as_mut() {
+            let _ = fp.write_all(&dab_frame_idx.to_le_bytes());
+            // Serialise i16 LE — matches the eti-stuff fic-handler dump.
+            let mut buf = Vec::with_capacity(dumps.viterbi_in.len() * 2);
+            for v in &dumps.viterbi_in {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            let _ = fp.write_all(&buf);
+        }
 
         // ---- Feed to the accumulator ----
         let prior_total = acc.fib_total;
@@ -285,6 +302,9 @@ pub fn process_iq_to_fic(
         let _ = fp.flush();
     }
     if let Some(mut fp) = descrambled_fp {
+        let _ = fp.flush();
+    }
+    if let Some(mut fp) = viterbi_in_fp {
         let _ = fp.flush();
     }
 
@@ -343,6 +363,12 @@ pub fn decode_fic_soft_bits_to_bytes(frame_soft: &[i16]) -> Vec<u8> {
 /// (PRBS polarity / seed), and the final packed bytes (bit-ordering).
 #[derive(Debug, Default)]
 pub struct DecodeDumps {
+    /// Per-ficBlock depunctured Viterbi *input* (3096 i16 soft bits each).
+    /// Full frame length = 4 * 3096 = 12384 entries. Matches what the
+    /// patched eti-stuff `ficHandler::process_ficInput` writes to its
+    /// `DAB_RS_ORACLE_VITERBI_IN` dump bit-for-bit (modulo the OFDM-side
+    /// soft-bit divergence which slice 7 is trying to measure).
+    pub viterbi_in: Vec<i16>,
     /// Pre-descramble Viterbi output, bit-per-byte (`0` / `1`). Length
     /// after a full frame: 4 * 768 = 3072 entries.
     pub viterbi_out: Vec<u8>,
@@ -365,6 +391,24 @@ pub fn decode_fic_soft_bits_with_dumps(
     let mut out = Vec::with_capacity(FIC_BYTES_PER_FRAME);
     let mut fic = FicProtection::new();
     for chunk in frame_soft.chunks_exact(FIC_IN_BITS) {
+        // Capture the depunctured Viterbi input by replaying the depuncture
+        // here against the public puncture table — this is what FicProtection
+        // builds internally before calling its scalar Viterbi. Slice-7
+        // cross-check uses this to verify dab-rs and the oracle hand the
+        // same 3096-soft-bit codeword to the Viterbi decoder.
+        let table = fic.index_table();
+        debug_assert_eq!(table.len(), dab_viterbi::FIC_VITERBI_LEN);
+        let mut viterbi_block = vec![0_i16; dab_viterbi::FIC_VITERBI_LEN];
+        let mut ic = 0_usize;
+        for i in 0..dab_viterbi::FIC_VITERBI_LEN {
+            if table[i] {
+                viterbi_block[i] = chunk[ic];
+                ic += 1;
+            }
+        }
+        debug_assert_eq!(ic, FIC_IN_BITS);
+        dumps.viterbi_in.extend_from_slice(&viterbi_block);
+
         // Stage A: depuncture + Viterbi decode → 768 info bits, bit-per-byte.
         let info_bits = fic.deconvolve(chunk);
         debug_assert_eq!(info_bits.len(), FIC_OUT_BITS);

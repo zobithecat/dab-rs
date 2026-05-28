@@ -470,36 +470,132 @@ dab_rs :  11110111 00110000 01011111 00000001 …   (uncorrelated noise)
   battle-tested on a real DAB stream, and our diagnostic just produced
   the first hard evidence that it is incorrect.
 
-## Slice-7 fork
+## Seventh-iteration findings (2026-05-29, Viterbi I/O cross-check)
 
-Bug now localised to `dab-viterbi`. Options in priority order:
+Slice 7 ran fork 2 of the slice-6 follow-up list: rather than port
+`viterbiSpiral` blind, dump the **Viterbi input** (3096-soft-bit
+depunctured codeword per ficBlock) and **Viterbi output** (768 hard
+bits per ficBlock) on the eti-stuff side, alongside the dab-rs
+equivalents, and bit-XOR aligned by frame_idx. The judgement was
+supposed to be one of:
 
-1. **Port `viterbiSpiral` to Rust** as a new `dab-viterbi` backend or a
-   sibling crate. The spiral variant is what every active eti-stuff path
-   uses (FIC, EEP, UEP all derive from `viterbiSpiral`; the scalar
-   `viterbiHandler` is commented out everywhere). It uses bit-reversed
-   polynomials `{0o155, 0o117, 0o123, 0o155}` and a different internal
-   state representation — it is plausible that this *is* the convention
-   the DAB transmitter encodes against, and that's why eti-stuff
-   doesn't ship a working scalar fall-back. Roughly ~250 LOC port from
-   `viterbi-spiral.cpp` (no SIMD intrinsics needed for correctness — a
-   scalar Rust translation will match bit-for-bit).
-2. **Bit-stream-level cross-check first.** Before porting, instrument
-   eti-stuff's `viterbiSpiral::deconvolve` with a `DAB_RS_DUMP_VITERBI_IN`
-   / `_OUT` pair and run it on the same `k8b_v4_2048k.wav32` to capture
-   its actual 2304-soft-bit input + 768-decoded-bit output per ficBlock.
-   Then bit-XOR against `dab-viterbi`'s output on the same input. If the
-   inputs match but outputs differ, dab-viterbi is wrong; if the inputs
-   *also* differ, the upstream OFDM bit-ordering inside the demap loop
-   needs auditing too.
-3. **Sanity-check FIC depuncturing.** Less likely but cheap: dump the
-   3096-bit mother codeword after depuncturing on both sides and diff.
-   If those match, the puncturing tables are fine and Viterbi is the
-   only candidate left.
+- Result A — inputs match, outputs differ → port `viterbiSpiral`.
+- Result B — inputs differ → audit OFDM bit-ordering / depuncture /
+  soft-bit sign upstream.
+- Result C — both match → check descrambler / FIB packing.
+
+Instrumentation
+- `docs/diag/eti-stuff-fic-handler-dump.patch` adds env-gated dumps
+  to `ficHandler::process_ficInput` (env vars
+  `DAB_RS_ORACLE_VITERBI_IN` and `DAB_RS_ORACLE_VITERBI_OUT`,
+  per-ficBlock records with `u32 frame_idx, u32 ficno` headers,
+  `fflush` per record).
+- `crates/dab-cli/src/fic_iq.rs` adds a matching env-gated dab-rs
+  side dump for the Viterbi *input*
+  (`DAB_RS_DUMP_VITERBI_IN`) — replays the depuncture against
+  `FicProtection::index_table()` so the dumped codeword is exactly
+  what the scalar Viterbi receives.
+- `docs/diag/viterbi_cross_check.py` reads all four files, aggregates
+  oracle's 4 ficBlock records per frame to match dab-rs's per-frame
+  layout, sweeps a `±100` frame-index offset, and reports per-position
+  diff histograms for both input (i16) and output (bit).
+
+Result on `k8b_v4_2048k.wav32` (oracle) vs `k8b_v4.iq` (dab-rs)
+- Viterbi input  (i16 exact match): **497 257 / 1 919 520 = 0.2591**
+  at best offset `oracle = dab_rs − 22`. Per-position diff rate is
+  uniformly **0.73 – 0.75** across every 1024-position bucket.
+- Viterbi output (hard-bit exact match): 238 668 / 476 160 = **0.5012**
+  at best offset `oracle = dab_rs − 43`. Per-position diff rate ≈ 0.50
+  everywhere — the expected random baseline for unrelated bit streams.
+
+### The 25.91 % match is the depuncture zero-fill
+
+The mother codeword is 3 096 bits; the FIC puncture table marks 2 304
+positions as transmitted (≈ 74.4 %) and 792 positions as zero-fill
+(≈ 25.6 %). The observed input-match rate is **0.2591**, which is
+within sampling noise of the 0.2558 zero-fill fraction. In other
+words: at every position the puncture table marks `false` (both sides
+zero-fill), they agree; at every position it marks `true` (both sides
+write a real soft bit), they disagree. The two implementations carry
+**different soft bits at every transmitted position**.
+
+### But the oracle is broken on this input — Result B is ambiguous
+
+Slice 4 already proved that the offline oracle's coarse-CFO loop
+fails to lock on `k8b_v4_2048k.wav32`: `coarseCorrector` stdev =
+16 988 Hz over the 155 frames, swinging ±33 kHz. That means the
+oracle reads a different set of FFT bins as "carrier k" on every
+frame. So Result B's "inputs differ" finding may be a side-effect of
+the oracle's instability (oracle reads wrong bins → wrong soft bits
+at wrong positions), not evidence that dab-rs's upstream OFDM
+bit-ordering is wrong. The oracle isn't a clean reference on this
+capture.
+
+Combined with the existing diagnostics:
+
+| Test                                                                | Match  | Interpretation                                |
+| ------------------------------------------------------------------- | ------:| --------------------------------------------- |
+| Slice 5: dab-rs `fic-iq` ensemble vs live `k8b_v4.eti`               | 0/2496 | dab-rs's downstream chain produces 0 FIBs.    |
+| Slice 6: dab-rs Viterbi **output** bits vs live ETI FIB bytes        | 0.5012 | dab-rs's Viterbi-out is unrelated to live.    |
+| Slice 7: dab-rs Viterbi **input**  i16  vs broken-oracle's input     | 0.2591 | 100 % of zero-fills agree, 100 % of real bits |
+|                                                                     |        | disagree (or oracle is reading wrong bins).   |
+| Slice 7: dab-rs Viterbi **output** bits vs broken-oracle's output    | 0.5012 | Random (expected, given input divergence).    |
+
+### Diagnosis after slice 7
+
+We **cannot** distinguish fork 1 (dab-viterbi wrong) from "OFDM-to-
+Viterbi handoff bit-ordering wrong" purely from this cross-check on
+the marginal K8B capture, because the oracle's coarseCorrector is
+itself broken on the same input. What we *do* know:
+
+- dab-rs OFDM Stage 1–7 produces statistically healthy soft bits
+  (slice 5, `mean |b|` = 63/127, balanced sign).
+- dab-rs Viterbi output is statistically unrelated to live ETI FIBs
+  (slice 6, 0.50 match at every offset and bit position).
+- dab-rs and the oracle disagree at every transmitted soft-bit
+  position before the Viterbi (slice 7).
+
+The most economical hypothesis that explains all three is still
+**gotcha #7** (`dab-viterbi` self-consistent but does not invert
+the real DAB transmitter). But this slice does *not* uniquely
+confirm it.
+
+## Slice-8 fork
+
+Bug still localised to `dab-viterbi` *or* the OFDM-to-Viterbi
+handoff. To distinguish without relying on the broken offline oracle:
+
+1. **Get a higher-SNR capture where the offline oracle locks.** The
+   slice-7 cross-check failed to be unambiguous purely because the
+   oracle's coarseCorrector blows up on `k8b_v4`. A capture clean
+   enough that `eti-cmdline-wavfiles` produces a non-zero ETI matching
+   the live oracle would give a stable Viterbi input/output reference
+   and *would* discriminate Result A from Result B. Candidates: a new
+   shorter capture at a known-good site, or `k8b_strong.iq` /
+   `k8b_v3.iq` if those have been recorded at a stronger gain or
+   antenna setup. This is the cheapest path back to a clean
+   comparator.
+2. **Direct dab-rs ↔ eti-stuff Viterbi unit-test.** Pick one ficBlock
+   of soft bits (any non-degenerate input) and call *both*
+   `viterbiSpiral::deconvolve` and `dab-viterbi`'s scalar Viterbi on
+   the *same* synthetic input. If they output identical 768 hard bits,
+   dab-viterbi is byte-equivalent to viterbiSpiral and the fork-1 port
+   would not change behaviour — the bug is elsewhere. If they differ,
+   the scalar Viterbi convention is wrong and fork 1 is justified
+   *with proof*. Easier than a full port and answers the open
+   question.
+3. **Audit OFDM-side bit ordering against EN 300 401 §14.6.** dab-rs's
+   `dqpsk_demap` writes 1536 I bits followed by 1536 Q bits per OFDM
+   symbol; the FIC handler then ingests three consecutive symbols
+   (9216 bits) and splits into 4 ficBlocks of 2304 each. Confirm
+   ETSI orders the same way (I-block-then-Q-block, frequency-
+   de-interleaved, not Q-first or carrier-interleaved). A single
+   permutation mistake here would explain Result B without any
+   Viterbi bug.
 4. **Run the airspy hardware sanity script** (`docs/diag/airspy-sanity.sh`)
-   in parallel — its result is orthogonal to the Viterbi fix but
-   resolves the still-open question of whether the oracle's offline
-   handlers diverge from the live path independent of dab-viterbi.
+   in parallel — orthogonal to the Viterbi question but still answers
+   the slice-4 fork about whether libairspy's two output paths are
+   byte-equivalent.
 
 ## Closing the patch
 

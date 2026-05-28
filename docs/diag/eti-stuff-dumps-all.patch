@@ -1,0 +1,198 @@
+diff --git a/eti-cmdline/src/eti-handling/fic-handler.cpp b/eti-cmdline/src/eti-handling/fic-handler.cpp
+index a8df864..2fccac3 100755
+--- a/eti-cmdline/src/eti-handling/fic-handler.cpp
++++ b/eti-cmdline/src/eti-handling/fic-handler.cpp
+@@ -178,11 +178,71 @@ int16_t inputCount	= 0;
+ 	for (i = 0; i < 3072 + 24; i ++)
+ 	   if (punctureTable [i])
+ 	      viterbiBlock [i] = ofdm_input [inputCount ++];
++
++	// ---- dab-rs Slice-7 diagnostic dumps (env-gated) ----
++	// DAB_RS_ORACLE_VITERBI_IN  → per-ficBlock depunctured codeword
++	//     (3096 × i16, in viterbiBlock-internal order — same as the
++	//     mother-codeword layout dab-rs's FicProtection assembles).
++	// DAB_RS_ORACLE_VITERBI_OUT → per-ficBlock 768 hard bits emitted
++	//     by viterbiSpiral, BEFORE the PRBS energy-dispersal XOR.
++	// Header per record: u32 frame_idx (1-based, increments on ficno==0),
++	// u32 ficno (0..3).  Both files are fflush'd per ficBlock so they
++	// are visible mid-run.
++	{
++	   static FILE *   _vi_fp        = nullptr;
++	   static FILE *   _vo_fp        = nullptr;
++	   static int      _vd_init      = 0;
++	   static uint32_t _vd_frame_idx = 0;
++	   if (!_vd_init) {
++	      const char *p;
++	      if ((p = getenv ("DAB_RS_ORACLE_VITERBI_IN")) != nullptr && *p) {
++	         _vi_fp = fopen (p, "wb");
++	         if (_vi_fp == nullptr)
++	            fprintf (stderr, "dab-rs slice7 in: fopen('%s') failed\n", p);
++	         else
++	            fprintf (stderr, "dab-rs slice7 in: writing viterbi input to %s\n", p);
++	      }
++	      if ((p = getenv ("DAB_RS_ORACLE_VITERBI_OUT")) != nullptr && *p) {
++	         _vo_fp = fopen (p, "wb");
++	         if (_vo_fp == nullptr)
++	            fprintf (stderr, "dab-rs slice7 out: fopen('%s') failed\n", p);
++	         else
++	            fprintf (stderr, "dab-rs slice7 out: writing viterbi output to %s\n", p);
++	      }
++	      _vd_init = 1;
++	   }
++	   if (ficno == 0) _vd_frame_idx++;
++	   if (_vi_fp != nullptr) {
++	      uint32_t hdr [2] = { _vd_frame_idx, (uint32_t) ficno };
++	      fwrite (hdr,          sizeof (uint32_t), 2,           _vi_fp);
++	      fwrite (viterbiBlock, sizeof (int16_t),  3072 + 24,   _vi_fp);
++	      fflush (_vi_fp);
++	   }
++	}
++
+ /**
+   *	Now we have the full word ready for deconvolution
+   *	deconvolution is according to DAB standard section 11.2
+   */
+ 	deconvolve (viterbiBlock, bitBuffer_out);
++
++	{
++	   static FILE *   _vo2_fp        = nullptr;
++	   static int      _vo2_init      = 0;
++	   static uint32_t _vo2_frame_idx = 0;
++	   if (!_vo2_init) {
++	      const char *p = getenv ("DAB_RS_ORACLE_VITERBI_OUT");
++	      if (p != nullptr && *p) _vo2_fp = fopen (p, "wb");
++	      _vo2_init = 1;
++	   }
++	   if (ficno == 0) _vo2_frame_idx++;
++	   if (_vo2_fp != nullptr) {
++	      uint32_t hdr [2] = { _vo2_frame_idx, (uint32_t) ficno };
++	      fwrite (hdr,           sizeof (uint32_t), 2,    _vo2_fp);
++	      fwrite (bitBuffer_out, sizeof (uint8_t),  768,  _vo2_fp);
++	      fflush (_vo2_fp);
++	   }
++	}
+ /**
+   *	if everything worked as planned, we now have a
+   *	768 bit vector containing three FIB's
+diff --git a/eti-cmdline/src/ofdm/ofdm-processor.cpp b/eti-cmdline/src/ofdm/ofdm-processor.cpp
+index 86655ae..8ed0309 100755
+--- a/eti-cmdline/src/ofdm/ofdm-processor.cpp
++++ b/eti-cmdline/src/ofdm/ofdm-processor.cpp
+@@ -406,7 +406,117 @@ SyncOnPhase:
+ 	      getSamples (ofdmBuffer, T_s, coarseCorrector + fineCorrector);
+ 	      for (i = (int)T_u; i < (int)T_s; i ++) 
+ 	         FreqCorr += ofdmBuffer [i] * conj (ofdmBuffer [i - T_u]);
++	      // ---- dab-rs Priority-4 diagnostic dump: per-symbol PRE-FFT
++	      //      time-domain (the T_u useful samples that processBlock will
++	      //      hand to the FFT). Opt-in via env var DAB_RS_DIAG_DUMP_PREFFT.
++	      //      Header: u32 frame_idx, u32 ofdmSymbolCount, then T_u
++	      //      complex<float> samples (re/im interleaved). Same record
++	      //      cadence as DAB_RS_DIAG_DUMP.
++	      {
++	         static FILE *   _pfp        = nullptr;
++	         static int      _pinit      = 0;
++	         if (!_pinit) {
++	            const char *p = getenv ("DAB_RS_DIAG_DUMP_PREFFT");
++	            if (p != nullptr && *p != '\0') {
++	               _pfp = fopen (p, "wb");
++	               if (_pfp == nullptr)
++	                  fprintf (stderr, "dab-rs diag prefft: fopen('%s') failed\n", p);
++	               else
++	                  fprintf (stderr, "dab-rs diag prefft: writing pre-FFT samples to %s\n", p);
++	            }
++	            _pinit = 1;
++	         }
++	         if (_pfp != nullptr) {
++	            // _shared_frame_idx is maintained by the post-FFT dump block
++	            // below; consult that for naming. Since both blocks see the
++	            // same ofdmSymbolCount sequence, we recompute frame index
++	            // locally using the same wrap-on-2 trick.
++	            static uint32_t _pframe_idx = 0;
++	            if (ofdmSymbolCount == 2) _pframe_idx++;
++	            uint32_t hdr [2] = { _pframe_idx, (uint32_t) ofdmSymbolCount };
++	            fwrite (hdr,                  sizeof (uint32_t),            2,    _pfp);
++	            fwrite (&ofdmBuffer [T_g],    sizeof (std::complex<float>), T_u,  _pfp);
++	         }
++	      }
++
+ 	      processBlock (ofdmBuffer, ibits);
++
++	      // ---- dab-rs Priority-1 + Priority-3 diagnostic dumps ----
++	      //
++	      // ibits dump (DAB_RS_DIAG_DUMP): per-symbol post-differential
++	      // soft bits. Each record: u32 frame_idx, u32 ofdmSymbolCount,
++	      // i16 ibits[2*carriers]. frame_idx increments on every
++	      // ofdmSymbolCount==2 wrap (start of a new frame's data region).
++	      //
++	      // fft dump (DAB_RS_DIAG_DUMP_FFT): the FFT bins *before* the
++	      // differential demap (Stage 6) ran — `fft_buffer` is post-FFT
++	      // and not mutated by the per-carrier demap loop, so it still
++	      // holds the bin values from immediately after `do_FFT()`.
++	      // Same header layout, payload is T_u complex<float> bins.
++	      //
++	      // meta dump (DAB_RS_DIAG_DUMP_META): once per frame (when
++	      // ofdmSymbolCount==2), the integer corrector values that drive
++	      // every getSamples call. Record: u32 frame_idx, i16
++	      // fineCorrector, padding, i32 coarseCorrector — 12 bytes.
++	      {
++	         static FILE *   _diag_fp        = nullptr;
++	         static FILE *   _fft_fp         = nullptr;
++	         static FILE *   _meta_fp        = nullptr;
++	         static int      _diag_init      = 0;
++	         static uint32_t _diag_frame_idx = 0;
++	         if (!_diag_init) {
++	            const char *p;
++	            if ((p = getenv ("DAB_RS_DIAG_DUMP")) != nullptr && *p) {
++	               _diag_fp = fopen (p, "wb");
++	               if (_diag_fp == nullptr)
++	                  fprintf (stderr, "dab-rs diag: fopen('%s') failed\n", p);
++	               else
++	                  fprintf (stderr, "dab-rs diag: writing per-symbol ibits to %s\n", p);
++	            }
++	            if ((p = getenv ("DAB_RS_DIAG_DUMP_FFT")) != nullptr && *p) {
++	               _fft_fp = fopen (p, "wb");
++	               if (_fft_fp == nullptr)
++	                  fprintf (stderr, "dab-rs diag fft: fopen('%s') failed\n", p);
++	               else
++	                  fprintf (stderr, "dab-rs diag fft: writing pre-differential bins to %s\n", p);
++	            }
++	            if ((p = getenv ("DAB_RS_DIAG_DUMP_META")) != nullptr && *p) {
++	               _meta_fp = fopen (p, "wb");
++	               if (_meta_fp == nullptr)
++	                  fprintf (stderr, "dab-rs diag meta: fopen('%s') failed\n", p);
++	               else
++	                  fprintf (stderr, "dab-rs diag meta: writing per-frame CFO to %s\n", p);
++	            }
++	            _diag_init = 1;
++	         }
++	         if (ofdmSymbolCount == 2)
++	            _diag_frame_idx++;
++	         if (_diag_fp != nullptr) {
++	            uint32_t hdr [2] = { _diag_frame_idx, (uint32_t) ofdmSymbolCount };
++	            fwrite (hdr,   sizeof (uint32_t), 2,             _diag_fp);
++	            fwrite (ibits, sizeof (int16_t),  2 * carriers,  _diag_fp);
++	         }
++	         if (_fft_fp != nullptr) {
++	            uint32_t hdr [2] = { _diag_frame_idx, (uint32_t) ofdmSymbolCount };
++	            fwrite (hdr,        sizeof (uint32_t),            2,    _fft_fp);
++	            fwrite (fft_buffer, sizeof (std::complex<float>), T_u,  _fft_fp);
++	         }
++	         if (_meta_fp != nullptr && ofdmSymbolCount == 2) {
++	            uint32_t f   = _diag_frame_idx;
++	            int16_t  fc  = fineCorrector;
++	            int16_t  pad = 0;
++	            int32_t  cc  = coarseCorrector;
++	            fwrite (&f,   sizeof (uint32_t), 1, _meta_fp);
++	            fwrite (&fc,  sizeof (int16_t),  1, _meta_fp);
++	            fwrite (&pad, sizeof (int16_t),  1, _meta_fp);
++	            fwrite (&cc,  sizeof (int32_t),  1, _meta_fp);
++	            // meta is tiny (12 B/frame * ~155 frames < 2 KB) so libc's
++	            // default block buffering keeps everything in-process; force
++	            // a flush each frame to make the file visible mid-run too.
++	            fflush (_meta_fp);
++	         }
++	      }
++
+ 	      my_etiGenerator -> processBlock (ibits, ofdmSymbolCount);
+ 	   }
+ 
