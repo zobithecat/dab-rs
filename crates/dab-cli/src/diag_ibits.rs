@@ -59,6 +59,10 @@ const ORACLE_HEADER_BYTES: usize = 8;
 const ORACLE_PAYLOAD_BYTES: usize = BITS_PER_SYMBOL * 2; // i16 * 3072
 const ORACLE_RECORD_BYTES: usize = ORACLE_HEADER_BYTES + ORACLE_PAYLOAD_BYTES;
 
+/// FFT-bin dump payload: T_u = 2048 complex<float> samples = 16384 bytes.
+const FFT_PAYLOAD_BYTES: usize = 2048 * 8;
+const FFT_RECORD_BYTES: usize = ORACLE_HEADER_BYTES + FFT_PAYLOAD_BYTES;
+
 /// Key for indexing per-symbol records.
 type SymKey = (u32, u32);
 

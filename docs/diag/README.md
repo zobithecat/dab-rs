@@ -36,8 +36,11 @@ cd /path/to/dab-rs
     /path/to/k8b_v4.iq           \
     /tmp/k8b_v4_2048k.cu8
 
-# 4. Run eti-cmdline-rawfiles with the env-var pointing at a dump path:
+# 4. Run eti-cmdline-rawfiles with one or more dump env-vars set:
 DAB_RS_DIAG_DUMP=/tmp/oracle_ibits.bin                                 \
+DAB_RS_DIAG_DUMP_FFT=/tmp/oracle_fft.bin                               \
+DAB_RS_DIAG_DUMP_PREFFT=/tmp/oracle_prefft.bin                         \
+DAB_RS_DIAG_DUMP_META=/tmp/oracle_meta.bin                             \
   /path/to/eti-stuff/eti-cmdline/build-rawfiles/eti-cmdline-rawfiles   \
   -F /tmp/k8b_v4_2048k.cu8                                             \
   -O /tmp/oracle_k8b_v4.eti                                            \
@@ -58,17 +61,29 @@ DAB_RS_DIAG_DUMP=/tmp/oracle_ibits.bin                                 \
 
 ## Dump format
 
-Per OFDM data symbol, one record of `8 + 2 * 3072 = 6152` bytes:
+The patch adds four independent env-var-gated dump channels. They share
+the same per-symbol record cadence and `(frame_idx, ofdm_symbol_idx)`
+header but carry different payloads. Enable as many or as few as you
+need by setting the matching env var to a writable file path before
+running `eti-cmdline-rawfiles`.
 
-| Field             | Size                 | Description                                        |
-| ----------------- | -------------------- | -------------------------------------------------- |
-| `frame_idx`       | `u32` (little-endian) | 1-based; increments on every `ofdmSymbolCount==2`. |
-| `ofdm_symbol_idx` | `u32` (little-endian) | 2..=76 (Mode I: 75 data symbols per frame).        |
-| `ibits[3072]`     | `i16` × 3072 (LE)     | 1536 I-bits at `[0..1536)`, 1536 Q-bits at `[1536..3072)`, range ±127. |
+| Env var                       | Channel | Payload (after the 8-byte header)                 | Bytes/record | When written |
+| ----------------------------- | ------- | ------------------------------------------------- | ------------ | ------------ |
+| `DAB_RS_DIAG_DUMP`            | ibits   | `i16[3072]` — Stage 7 demap soft bits (±127).     | 6 152        | every data symbol (`ofdmSymbolCount` 2..76) |
+| `DAB_RS_DIAG_DUMP_FFT`        | fft     | `complex<float>[2048]` — `fft_buffer` *after* `do_FFT`, *before* the differential. | 16 392 | every data symbol |
+| `DAB_RS_DIAG_DUMP_PREFFT`     | prefft  | `complex<float>[2048]` — `ofdmBuffer[T_g..T_g+T_u]`, the time-domain useful part going into the FFT. | 16 392 | every data symbol |
+| `DAB_RS_DIAG_DUMP_META`       | meta    | `u32 frame_idx, i16 fineCorrector, i16 _pad, i32 coarseCorrector` (12 bytes, no `ofdm_symbol_idx`). | 12 | once per frame (when `ofdmSymbolCount==2`) |
 
-The eti-stuff side writes one record per `processBlock` invocation. Each
-record is the raw oracle soft-bit output that ordinarily feeds
-`viterbiSpiral` via the FIC / EEP / UEP protection front-ends.
+All multi-byte fields are little-endian. The meta channel is `fflush`'d
+each frame so it's visible to readers mid-run; the per-symbol channels
+let libc buffer them and rely on `fclose` at process exit.
+
+`fft_buffer` is *not* mutated by `processBlock`'s per-carrier demap
+loop (`r1 = fft_buffer[idx] * conj(referenceFase[idx])` only reads
+`fft_buffer`), so dumping immediately after `processBlock` returns
+captures the pre-differential FFT output verbatim. The header
+`frame_idx` increments on every `ofdmSymbolCount==2`, so all four
+channels share the same frame numbering.
 
 ## First-iteration findings (2026-05-28)
 
@@ -101,16 +116,73 @@ CFO rotates every consecutive-symbol differential by a fixed angle,
 which produces exactly this "right distribution, wrong values"
 signature.
 
-## Next steps
+## Second-iteration findings (2026-05-28, P3 + P1 + P4 dumps added)
 
-To localise the divergence further, additional dump points are needed:
+With the meta + fft + prefft channels enabled and the same K8B
+`k8b_v4_2048k.cu8` input, the META dump reveals **why** the ibits
+comparison gave random-baseline match rate: *the oracle never reaches a
+stable CFO lock on the CU8-quantised input.* `coarseCorrector` (per
+ETSI §, applied via NCO in time domain, units = Hz) jumps wildly
+frame-to-frame and is repeatedly reset by the
+`abs(coarseCorrector) > Khz(35)` guard:
 
-- Per-frame: PRS start sample index, fractional CFO estimate (in Hz),
-  integer CFO offset (in carriers).
-- Per data symbol: the FFT output (`fft_buffer[T_u]`) before the
-  differential, so dab-rs's `SymbolFft::fft_symbol` output can be
-  compared bin-for-bin.
+| frame | fineCorrector (Hz) | coarseCorrector (Hz) |
+| ----- | ------------------ | -------------------- |
+| 1     | 0                  | −9 000               |
+| 2     | 47                 | +17 000              |
+| 3     | 52                 | 0 (reset)            |
+| 5     | 43                 | −10 000              |
+| 8     | −47                | +20 000              |
+| 15    | −121               | −25 000              |
+| 28    | −265               | −33 000              |
+| 30    | −354               | +25 000              |
+| 151   | −192               | −23 000              |
+| 155   | −235               | +10 000              |
 
-The patch is intentionally minimal so it stays a single hunk against a
-clean eti-stuff tree. Add additional dump hooks alongside the existing
-one as needed for follow-up investigations.
+`fineCorrector` (the fractional residual) drifts in a *somewhat* sane
+way — settles around −200 Hz after ~30 frames — but `coarseCorrector`
+implies the oracle thinks the integer-carrier CFO swings by ±25 carriers
+every other frame. Each such swing reads a different set of FFT bins for
+the same logical carrier indices, so the post-differential soft bits get
+scrambled differently on every frame.
+
+That explains the diag-ibits histogram: *both pipelines see the same
+input, but the oracle is processing it from a different bin offset on
+every frame*. dab-rs's `detect_integer_cfo` confidence guard
+(`peak > 1.5 × runner_up`) keeps it at `δ = 0` when the correlation is
+noisy, which on this input is most of the time. The two pipelines are
+effectively reading carriers at different bin positions and producing
+uncorrelated ibits as a consequence.
+
+Equally important: the **oracle's coarse-CFO loop is in trouble**, not
+dab-rs's. Stage A above also failed (0-byte ETI), which is consistent
+with the unstable coarseCorrector. So this particular comparison oracle
+is **not a reliable byte-identical reference for the cu8 path**. Two
+follow-up paths to consider:
+
+1. **Give the oracle a better input.** The CU8 quantisation drops the
+   bottom 8 bits of dynamic range. At our marginal 12 dB SNR that may
+   sit right at the lock threshold. Options: pre-scale the f32 samples
+   before quantising so the per-sample peak fills more of the byte
+   range, or switch to a libsndfile-readable 16-bit WAV (eti-stuff's
+   `WAVFILES=ON` build) so we keep the full Cs16 precision.
+2. **Pick a different comparison surface.** Within a single frame,
+   coarse + fine corrector are constant, so the *within-frame*
+   differential demap is still informative — just don't expect the
+   *between-frame* state (and therefore the absolute soft-bit values
+   placed onto specific carriers) to match. A comparator that aligns
+   on band-energy structure rather than per-position equality would be
+   more robust against this kind of oracle instability.
+
+The dab-rs `dab fic-iq` pipeline produces 0 / 2496 valid FIBs on the
+*same* `k8b_v4.iq` capture even when its OFDM black-box test passes —
+so dab-rs may have its own bugs too. But the oracle dump no longer
+serves as a clean ground truth on this input, and the next slice has
+to decide which fork to take above before more comparison work is
+useful.
+
+## Closing the patch
+
+The patch is intentionally minimal so it stays a small set of hunks
+against a clean eti-stuff tree. Add additional dump hooks alongside
+the existing ones as needed for follow-up investigations.
