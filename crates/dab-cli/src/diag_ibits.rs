@@ -60,7 +60,11 @@ const ORACLE_PAYLOAD_BYTES: usize = BITS_PER_SYMBOL * 2; // i16 * 3072
 const ORACLE_RECORD_BYTES: usize = ORACLE_HEADER_BYTES + ORACLE_PAYLOAD_BYTES;
 
 /// FFT-bin dump payload: T_u = 2048 complex<float> samples = 16384 bytes.
+/// Currently unused — kept for the planned FFT-comparator that consumes
+/// `oracle_fft.bin` produced by `DAB_RS_DIAG_DUMP_FFT`.
+#[allow(dead_code)]
 const FFT_PAYLOAD_BYTES: usize = 2048 * 8;
+#[allow(dead_code)]
 const FFT_RECORD_BYTES: usize = ORACLE_HEADER_BYTES + FFT_PAYLOAD_BYTES;
 
 /// Key for indexing per-symbol records.

@@ -48,17 +48,23 @@ enum Command {
         #[arg(long, default_value_t = 3_000_000)]
         rate: u32,
     },
-    /// Resample a `Cs16Le @ 3 MSPS` capture and quantize it to `CU8 @ 2.048
-    /// MSPS` — the format eti-stuff's `eti-cmdline-rawfiles` expects.
-    /// Lets the oracle binary process the same captures dab-rs handles
-    /// natively, so the two pipelines can be cross-checked on identical
-    /// resampled samples (the CU8 quantization adds ~−48 dB noise, which
-    /// is well below any real chain-bug-sized divergence).
+    /// Resample a `Cs16Le @ 3 MSPS` capture to 2.048 MSPS and emit it in a
+    /// format an eti-stuff offline input handler can consume.
+    ///
+    /// `--out cu8`  → `(uint8 I, uint8 Q)` for `eti-cmdline-rawfiles`.
+    /// `--out wav`  → 16-bit PCM stereo WAV for `eti-cmdline-wavfiles`
+    ///                (preserves the source 12-bit precision through to
+    ///                the oracle; the cu8 path drops ~3 effective bits on
+    ///                the K8B capture and starves the oracle's coarse-CFO
+    ///                loop).
     ConvertIq {
         /// Input `Cs16Le @ 3 MSPS` capture.
         input: PathBuf,
-        /// Output `CU8 @ 2.048 MSPS` file.
+        /// Output file.
         output: PathBuf,
+        /// `cu8` or `wav` (default `wav`).
+        #[arg(long, default_value = "wav")]
+        out: String,
     },
     /// Cross-validate dab-rs's per-symbol soft bits against an oracle dump
     /// produced by the patched `eti-cmdline-rawfiles` (env var
@@ -102,7 +108,7 @@ fn main() -> Result<()> {
         Command::Fec { eti, subch } => run_fec(&eti, subch),
         Command::Fic { eti } => run_fic(&eti),
         Command::FicIq { iq, format, rate } => run_fic_iq(&iq, &format, rate),
-        Command::ConvertIq { input, output } => run_convert_iq(&input, &output),
+        Command::ConvertIq { input, output, out } => run_convert_iq(&input, &output, &out),
         Command::DiagIbits { iq, oracle, frames, ingest } => {
             run_diag_ibits(&iq, &oracle, frames, &ingest)
         }
@@ -137,15 +143,30 @@ fn run_diag_ibits(
     Ok(())
 }
 
-fn run_convert_iq(input: &std::path::Path, output: &std::path::Path) -> Result<()> {
-    let pairs = dab_cli::convert_iq::convert_cs16_3m_to_cu8_2048k(input, output)?;
-    let bytes = pairs * 2;
+fn run_convert_iq(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    out_fmt: &str,
+) -> Result<()> {
+    let (pairs, bytes_per_pair, label) = match out_fmt.to_lowercase().as_str() {
+        "cu8" => {
+            let p = dab_cli::convert_iq::convert_cs16_3m_to_cu8_2048k(input, output)?;
+            (p, 2_usize, "CU8")
+        }
+        "wav" => {
+            let p = dab_cli::convert_iq::convert_cs16_3m_to_wav_2048k(input, output)?;
+            (p, 4_usize, "WAV 16-bit PCM stereo")
+        }
+        other => anyhow::bail!("unsupported --out {other} (use cu8 or wav)"),
+    };
+    let bytes = pairs * bytes_per_pair;
     let mb = bytes as f64 / (1024.0 * 1024.0);
     println!(
-        "wrote {} CU8 sample pairs ({} bytes ≈ {:.1} MiB) to {}",
+        "wrote {} sample pairs ({} bytes ≈ {:.1} MiB, {}) to {}",
         pairs,
         bytes,
         mb,
+        label,
         output.display(),
     );
     Ok(())

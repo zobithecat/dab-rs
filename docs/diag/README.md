@@ -29,14 +29,16 @@ cd eti-cmdline/build-rawfiles
 cmake ..  -DRAWFILES=ON      # only needed on first build
 make
 
-# 3. Resample + quantise an existing Cs16Le @ 3 MSPS capture into the CU8
-#    @ 2.048 MSPS format the rawfiles binary consumes:
+# 3a. Resample to either CU8 @ 2.048 MSPS (--out cu8) or 16-bit PCM
+#     stereo WAV @ 2.048 MSPS (--out wav, default). WAV preserves the
+#     full source precision; CU8 is more compact but lossy at low SNR.
 cd /path/to/dab-rs
-./target/release/dab convert-iq  \
-    /path/to/k8b_v4.iq           \
-    /tmp/k8b_v4_2048k.cu8
+./target/release/dab convert-iq           \
+    /path/to/k8b_v4.iq                    \
+    /tmp/k8b_v4_2048k.wav                 \
+    --out wav     # or --out cu8
 
-# 4. Run eti-cmdline-rawfiles with one or more dump env-vars set:
+# 3b. (CU8 path) Run eti-cmdline-rawfiles with one or more dump env-vars:
 DAB_RS_DIAG_DUMP=/tmp/oracle_ibits.bin                                 \
 DAB_RS_DIAG_DUMP_FFT=/tmp/oracle_fft.bin                               \
 DAB_RS_DIAG_DUMP_PREFFT=/tmp/oracle_prefft.bin                         \
@@ -44,6 +46,18 @@ DAB_RS_DIAG_DUMP_META=/tmp/oracle_meta.bin                             \
   /path/to/eti-stuff/eti-cmdline/build-rawfiles/eti-cmdline-rawfiles   \
   -F /tmp/k8b_v4_2048k.cu8                                             \
   -O /tmp/oracle_k8b_v4.eti                                            \
+  -D 15 -t 22
+
+# 3c. (WAV path) Same dump env-vars, but the WAVFILES build:
+#     (build first with: cd build-wavfiles && cmake -DWAVFILES=ON \
+#      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 .. && make)
+DAB_RS_DIAG_DUMP=/tmp/oracle_wav_ibits.bin                             \
+DAB_RS_DIAG_DUMP_FFT=/tmp/oracle_wav_fft.bin                           \
+DAB_RS_DIAG_DUMP_PREFFT=/tmp/oracle_wav_prefft.bin                     \
+DAB_RS_DIAG_DUMP_META=/tmp/oracle_wav_meta.bin                         \
+  /path/to/eti-stuff/eti-cmdline/build-wavfiles/eti-cmdline-wavfiles   \
+  -F /tmp/k8b_v4_2048k.wav                                             \
+  -O /tmp/oracle_wav.eti                                               \
   -D 15 -t 22
 
 # 5. Cross-validate with dab-rs:
@@ -180,6 +194,91 @@ so dab-rs may have its own bugs too. But the oracle dump no longer
 serves as a clean ground truth on this input, and the next slice has
 to decide which fork to take above before more comparison work is
 useful.
+
+## Third-iteration findings (2026-05-28, WAV path + scale audit)
+
+The cu8 path's failure motivated trying eti-stuff's `WAVFILES=ON` build
+so the source `Cs16Le` precision could survive the round-trip through
+libsndfile (16-bit PCM @ 2.048 MSPS). `dab convert-iq --out wav`
+produces the file, `eti-cmdline-wavfiles` reads it. End result on
+`k8b_v4.iq`:
+
+- WAV file generated: 164 MiB, valid RIFF/WAVE header verified by `xxd`.
+- `eti-cmdline-wavfiles` *still* fails to lock — 0-byte ETI, same
+  `coarseCorrector` instability signature as the cu8 path
+  (`coarseCorrector` stdev ≈ 17 000, range [−33 k, +33 k]).
+
+That ruled out cu8 quantisation as the root cause. The real problem
+sits one level deeper: **input-amplitude scale mismatch** between
+eti-stuff's online and offline input handlers.
+
+```
+eti-cmdline-airspy:    airspy-handler.cpp:337
+                       sample / 2048   (12-bit raw → ~[−1, +1])
+eti-cmdline-rawfiles:  rawfile-handler.cpp:98
+                       (sample - 128) / 128   (CU8 mid-zero → [−1, +1])
+eti-cmdline-wavfiles:  wavfile-handler.cpp via sf_readf_float
+                       libsndfile divides 16-bit PCM by 32768  → ~[−1/16, +1/16] on our data
+```
+
+The K8B capture's `Cs16Le` values measured: `p50=1807, p99=7018,
+max=12940`, i.e. **~21 %** of the 16-bit range. That sits awkwardly
+in the gap between airspy-handler's `/2048` (would produce ~±6.3,
+heavy saturation) and libsndfile's `/32768` (produces ~±0.21, 16× too
+small relative to airspy-handler-equivalent OFDM input). The live
+`eti-cmdline-airspy` run that produced `k8b_v4.eti` saw airspy-handler
+scaling; both offline handlers feed the OFDM processor at a *different*
+amplitude. If even one early-sync stage in eti-stuff has an absolute
+amplitude threshold (the null detector is the obvious suspect), this
+single-stage mismatch can cascade into the coarseCorrector instability
+we see in every meta dump.
+
+**Bit-usage measurement** (Step 1 of the slice-3 plan), confirming the
+21 % figure:
+
+```
+$ python3  # over 2 M IQ half-samples from k8b_v4.iq, cs16le @ 3 MSPS
+mean   2150.9    rms   2707.1
+p50    1807      p90   4463
+p99    7018      max  12940
+```
+
+(Same script reused — runs in 5 s.)
+
+**Resampler spec** (Step 2 of the v2 plan): the dab-rs polyphase
+resampler is `L = 256, M = 375` (exact 256/375 = 2.048M / 3.000M),
+**16 taps per phase**, **Blackman-windowed sinc** prototype of length
+`16·256 + 1 = 4097`, cutoff `1/M` (cycles/sample at upsampled rate to
+honour the anti-aliasing edge). Blackman stops at ~−58 dB sidelobes,
+which is weaker than scipy's default Kaiser β=14 (−126 dB) but
+comfortably above the K8B 12 dB SNR floor. Linear-phase, group delay
+`(4097 − 1)/2 = 2048` upsampled samples ≈ 5.46 input samples.
+
+The resampler is run *once* by `dab convert-iq` and its output is
+consumed identically by both pipelines via the WAV file, so it cannot
+itself be a source of dab-rs vs oracle divergence.
+
+## Next-slice fork
+
+Three concrete options, in order of preference:
+
+1. **32-bit float WAV with airspy-handler-equivalent scaling.** Write
+   `SF_FORMAT_WAV | SF_FORMAT_FLOAT` with samples pre-scaled to match
+   airspy-handler's `/2048` output (no 16-bit-PCM clipping issue since
+   floats can carry values > 1). Most likely to make the offline oracle
+   behave the same as the live one.
+2. **Patch `wavfile-handler.cpp` to multiply by 16 after libsndfile**
+   reads, instead of changing the writer. Equivalent in effect, larger
+   change to eti-stuff.
+3. **Use `dab fic-iq` on the WAV input directly.** Skip the oracle
+   altogether for the byte-identical step; instead validate
+   dab-rs against the live `k8b_v4.eti` by feeding the same WAV through
+   our pipeline and comparing the FIB CRC pass rate or ensemble model
+   to the live capture's metadata.
+
+The infrastructure (patched eti-stuff with four dump channels,
+`dab convert-iq --out wav`, `dab diag-ibits`, `dab diag-pair`) is all
+in place — the next slice picks one of the three forks and exercises it.
 
 ## Closing the patch
 
