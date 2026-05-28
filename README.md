@@ -65,22 +65,28 @@ target); Week 1 additionally reproduces the Python
     and an FFT wrapper. Input-independent and deterministic, so verified
     directly against `eti-stuff` (e.g. the interleaver is proven a bijection
     onto {−768..−1}∪{1..768}).
-  - 🔨 The 7-stage sync/demod chain:
+  - ✅ The 7-stage sync/demod chain:
     1. ✅ Resample 3 → 2.048 MSPS (polyphase, L/M = 256/375) — `dab-ofdm::Resampler`
     2. ✅ Coarse time sync (null-symbol envelope dip, adaptive threshold) — `dab-ofdm::NullDetector`
     3. ✅ Fine time + fractional frequency offset (cyclic-prefix autocorrelation) — `dab-ofdm::CpSync`
-    4. ⬜ Frequency correction (NCO) + integer-carrier (coarse) offset via PRS
-    5. ⬜ 2048-point FFT (`rustfft`)
-    6. ⬜ Channel equalisation against the phase-reference symbol
-    7. ⬜ π/4-DQPSK demap → soft bits (`+ ⇒ bit 1`; see *Discovered subtleties*)
+    4. ✅ NCO frequency correction + integer-carrier offset via PRS — `dab-ofdm::{Nco, detect_integer_cfo}`
+    5. ✅ Per-symbol 2048-point FFT framing (`rustfft`) — `dab-ofdm::SymbolFft`
+    6. ✅ Differential per-carrier reference (`current * conj(prev)`) — `dab-ofdm::DifferentialReference`
+    7. ✅ π/4-DQPSK demap + frequency de-interleave → soft bits — `dab-ofdm::DqpskDemap`
+       (`+ ⇒ bit 1`; see *Discovered subtleties*)
 
-  Stages 1-3 are validated on a real 20 s K8B capture (`dab-iq` reads the
-  INT16_IQ @ 3 MSPS file): 60 000 000 → 40 960 000 samples, **210 null dips**
+  Stages 1–3 are validated on a real 20 s K8B capture (`dab-iq` reads the
+  INT16_IQ @ 3 MSPS file): 60 000 000 → 40 960 000 samples, **~208 null dips**
   at the 96 ms DAB frame cadence (frame period 196 593 ≈ 196 608), and **CP
-  autocorrelation locking 50/50 symbol periods** (peak metric 0.69) with a
-  stable fractional CFO of −367 Hz. Matches the Python reference
-  (`tools/iq_validate_dab.py`: 207 dips, 98% CP lock). Reaching step 7
-  unblocks full per-symbol cross-validation against `eti-stuff`.
+  autocorrelation locking 50/50 symbol periods** (peak metric 0.69). Stages
+  4–7 are validated end-to-end through the differential demap on the new
+  best oracle `k8b_v4.iq` (`tests/k8b_v4_ofdm_chain.rs`): PRS FFT band ratio
+  active/guard ≫ 10 dB, |integer CFO| ≤ 2 carriers, and 75 × 3072 soft bits
+  per frame with mean |·| > 60/127 and a balanced sign distribution — i.e.
+  the demap is producing real information, not a stuck pattern. Full
+  byte-identical end-to-end cross-validation against `k8b_v4.eti` is the
+  next slice (dab-cli orchestrator: Stage 7 → Viterbi → descramble →
+  outer FEC → ETI(NI) framing).
 - ✅ **`dab-iq` — file I/Q input.** Reads Cs8 / Cs16Le / Cf32Le with JSON
   sidecar auto-detection; feeds the resampler. (Live `libairspy` SDR capture
   via bindgen FFI is a later add — see the Airspy 12-bit note in *Discovered
@@ -102,7 +108,7 @@ target); Week 1 additionally reproduces the Python
 | ----- | ---------------------------------- | ----------------------------------- | ------------------------------------------------- |
 | A     | Outer FEC + ETI/MSC + FIC          | Python `airspy-mini-dmb` + `.eti`   | ✅ byte-identical (87.3 % RS; ensemble "YTN DMB") |
 | B     | Inner FEC (Viterbi + descramble)   | `eti-stuff` intermediate dump       | ⬜ deferred — needs raw I/Q or OFDM soft bits     |
-| C     | OFDM core                          | K8B raw I/Q + `eti-stuff` per-symbol | 🔨 stages 1-3 validated on real K8B I/Q; 4-7 next |
+| C     | OFDM core                          | K8B raw I/Q + `eti-stuff` per-symbol | 🔨 stages 1–7 black-box validated on `k8b_v4.iq`; byte-identical end-to-end next |
 
 > A 20 s K8B raw I/Q capture (`k8b_rust.iq`, INT16_IQ @ 3 MSPS, in the
 > `airspy-mini-dmb` repo under Git LFS) now exists and drives the Stage C
@@ -174,6 +180,24 @@ contributor (or the next paper reviewer) deserves to know up front.
   threshold** `p1 + 0.30·(p99 − p1)` over the smoothed envelope, which
   recovers the 96 ms cadence cleanly even at ~7 dB SNR. The shallow-null
   case is covered by a dedicated unit test.
+
+- **Airspy AGC (`-G 0`) is sub-optimal for marginal indoor SNR**
+  *(planned, `dab-iq-airspy`).* On the same indoor K8B antenna setup, a
+  systematic 17-config gain sweep (25 s test capture per config) shows
+  that hardware AGC under-amplifies in the small-signal regime: with
+  `-G 0` the firmware locks the mixer at a working level but holds the
+  VGA at its default 10, leaving ~20 dB of headroom unused. Manual
+  **LNA 14 / Mixer 15 / VGA 12** yielded **4 619–4 852 RS-corrected
+  blocks per 25 s** versus **241 for `-G 0`** — a 20× improvement,
+  with `fibquality` saturating at 100. The sensitivity-index modes
+  (`-G N`) follow a fixed AGC curve biased for handheld-portable use,
+  not for marginal-SNR indoor. The `k8b_v4` oracle capture in the
+  companion repo was recorded with this manual profile and is the
+  first reproducible YTN DMB video decode at our Sinnonhyeon test
+  site. The forthcoming `dab-iq-airspy` libairspy FFI must default to
+  manual L14/M15/V12, expose all three stages via env vars (so
+  capture conditions stay reproducible), and treat `-G 0` as opt-in
+  rather than the default.
 
 ## Build & test
 

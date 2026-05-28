@@ -1,48 +1,62 @@
 //! `dab-ofdm` — DAB Mode I OFDM demodulator.
 //!
-//! This crate is built in two slices. The current slice is the **static
-//! foundation**: the input-independent, deterministic reference data plus an
-//! FFT wrapper that every later stage depends on. It is a faithful port of the
-//! `eti-stuff` C++ oracle and of ETSI EN 300 401:
+//! Faithful Rust port of the eti-stuff C++ oracle, validated stage-by-stage
+//! against ETSI EN 300 401. The crate is split into a static foundation
+//! (input-independent reference data) and a 7-stage runtime sync/demod chain.
 //!
-//! - [`params`]        — DAB Mode I transmission parameters (§14.5).
-//! - [`phasetable`]    — Mode I reference-phase function `get_phi(k)` (§14.3.2).
-//! - [`phasereference`]— the frequency-domain Phase-Reference Symbol (§14.3.2).
+//! # Static foundation
+//!
+//! - [`params`]         — DAB Mode I transmission parameters (§14.5).
+//! - [`phasetable`]     — Mode I reference-phase function `get_phi(k)` (§14.3.2).
+//! - [`phasereference`] — the frequency-domain Phase-Reference Symbol (§14.3.2).
 //! - [`freq_interleaver`] — the Mode I frequency (de-)interleaving table (§14.6).
-//! - [`fft`]           — a thin `rustfft` wrapper (forward + inverse).
+//! - [`fft`]            — a thin `rustfft` wrapper (forward + inverse).
 //!
-//! # Deferred: the 7-stage sync chain (Week 3-5)
+//! # 7-stage sync/demod chain
 //!
-//! The runtime, input-dependent demodulation pipeline is NOT implemented yet.
-//! It will build on this static foundation in a later slice:
+//! Each stage consumes the output of the previous one and exposes types listed
+//! in [`prelude`-style re-exports](#reexports) below:
 //!
-//! 1. Null-symbol detection (frame start / energy dip).
-//! 2. Coarse time synchronization (PRS correlation, `findIndex`).
-//! 3. Coarse frequency synchronization (`estimateOffset` via phase differences).
-//! 4. Fine time/frequency synchronization (cyclic-prefix tracking).
-//! 5. Per-symbol FFT (strip guard interval, transform the useful part).
-//! 6. Differential demodulation (DQPSK against the previous symbol).
-//! 7. Frequency de-interleaving (apply [`freq_interleaver`]) to recover soft bits.
-//
-// TODO (Week 3-5 sync chain): implement stages 1-7 above. No stub functions are
-// provided here on purpose — the foundation must not pretend to demodulate.
+//! 1. Resample 3 → 2.048 MSPS (polyphase, L/M = 256/375) — [`Resampler`].
+//! 2. Coarse time sync (null-symbol envelope dip, adaptive threshold) — [`NullDetector`].
+//! 3. Fine time + fractional frequency offset (cyclic-prefix autocorrelation) — [`CpSync`].
+//! 4. NCO frequency correction + integer carrier offset via PRS — [`Nco`], [`detect_integer_cfo`].
+//! 5. Per-symbol FFT framing (strip guard, transform useful part) — [`SymbolFft`].
+//! 6. Differential per-carrier reference (`current * conj(prev)`) — [`DifferentialReference`].
+//! 7. π/4-DQPSK demap + frequency de-interleave → soft bits — [`DqpskDemap`].
+//!
+//! Stage 6 is *not* a true `Ĥ[k]`-estimating equalizer: DAB's π/4-DQPSK is
+//! intrinsically differential, so the previous symbol's spectrum is the
+//! per-carrier reference and the channel cancels in the conjugate product
+//! (matches `eti-stuff/src/ofdm/ofdm-processor.cpp::processBlock`). Stage 7's
+//! soft-bit polarity follows the `+ ⇒ bit 1` convention — see the project
+//! README *Discovered subtleties*.
 
 #![forbid(unsafe_code)]
 
+pub mod channel_eq;
 pub mod cp_sync;
+pub mod dqpsk_demap;
 pub mod fft;
 pub mod freq_interleaver;
+pub mod integer_cfo;
+pub mod nco;
 pub mod null_detect;
 pub mod params;
 pub mod phasereference;
 pub mod phasetable;
 pub mod resampler;
+pub mod symbol_fft;
 
+pub use channel_eq::DifferentialReference;
 pub use cp_sync::{CpMetric, CpSync, LockReport};
+pub use dqpsk_demap::{jan_abs, DqpskDemap};
 pub use fft::Fft;
 pub use freq_interleaver::FreqInterleaver;
+pub use integer_cfo::{detect_integer_cfo, IntegerCfoResult};
+pub use nco::{mix_frequency, Nco};
 pub use null_detect::{NullDetectResult, NullDetector};
 pub use params::DabParams;
 pub use phasereference::phase_reference;
-pub use phasetable::get_phi;
 pub use resampler::{resample_3m_to_2048k, Resampler};
+pub use symbol_fft::SymbolFft;
