@@ -645,14 +645,115 @@ the OFDM demap and the Viterbi:
    vs `r = conj(current) * prev` would conjugate every soft bit's
    imaginary part — same magnitude but inverted Q.
 
-## Slice-9 fork
+## Ninth-iteration findings (2026-05-29, 15-transform sweep ↦ Result N)
 
-The remaining options are now:
+Slice 9 ran slice-8's fork 1 as a 15-transform sweep over the actual
+`dqpsk_demap` output of one ficBlock, looking for a byte-level fix.
 
-Bug is now provably **upstream of the Viterbi**, somewhere in the
-OFDM-to-FIC handoff (depuncture, ficBlock split, freq-de-interleave,
-soft-bit polarity, or differential demap reference sign). In rough
-order of cheapest to test:
+New infrastructure
+- `crates/dab-cli/src/fic_iq.rs` learns `DAB_RS_DUMP_DEMAP_OUT`, a
+  per-frame `u32 frame_idx + 9216 i8` dump of the raw pre-depuncture
+  OFDM demap output (the soft bits that `FicProtection::deconvolve`
+  ingests verbatim).
+- `docs/diag/transform_bisect.py` extracts one 2304-byte ficBlock,
+  applies each of 15 candidate byte-level transforms, pipes the
+  result through `dab viterbi-cli`, descrambles with the FIC PRBS,
+  packs MSB-first into 3 × 32-byte FIBs, and reports CRC pass /
+  best-bit-match against a live ETI reference FIB.
+
+Transforms tried (T0..T14): identity, byte-negate, bit-reverse-
+per-byte, full reverse, half-swap, half-interleave, half-reverse /
+half-negate variants, byte rotations, pair swap, per-768-bit
+reverse, alternate-byte negate.
+
+Result on dab-rs frame 0, ficBlock 0 vs live ETI frame 0 slot 0
+
+```
+transform                     CRC /3  best FIB bit-match
+T0  identity                       0     130/256 = 0.5078
+T1  byte_negate                    0     136/256 = 0.5312
+T2  bit_reverse_per_byte           0     129/256 = 0.5039
+T3  full_reverse                   0     143/256 = 0.5586
+T4  swap_halves                    0     139/256 = 0.5430
+T5  interleave_halves              0     133/256 = 0.5195
+T6  reverse_first_half             0     121/256 = 0.4727
+T7  reverse_second_half            0     137/256 = 0.5352
+T8  negate_first_half              0     126/256 = 0.4922
+T9  negate_second_half             0     136/256 = 0.5312
+T10 rotate_left_1byte              0     128/256 = 0.5000
+T11 rotate_right_1byte             0     127/256 = 0.4961
+T12 byte_pair_swap                 0     133/256 = 0.5195
+T13 reverse_per_768                0     132/256 = 0.5156
+T14 negate_alt_bytes               0     145/256 = 0.5664
+```
+
+**Result N** — no single transform produces a valid FIB. All 15 sit
+in a narrow 121 – 145 / 256 band centred on the random 50 % baseline
+(0.473 – 0.566). The best (`negate_alt_bytes` at 0.566) is barely
+above noise.
+
+What Result N rules out
+
+Soft-bit polarity, byte ordering, half-swap, byte rotations, and
+per-768-bit reverses all leave the FIC chain producing near-random
+output. That rules out:
+
+- Uniform sign-flip on the entire ficBlock.
+- Byte-order reversal of the 2304-byte iteration.
+- Per-byte bit-reversal (a packing endianness flip).
+- I-block ↔ Q-block swap at the 1152-byte boundary.
+- Per-768-bit chunk reversal (FIB-internal misalignment).
+- Single-byte rotation (off-by-one carrier at byte level).
+
+The bug therefore lives **inside** one of the OFDM stages whose
+output isn't a single permutation of the 2304-byte buffer. Three
+remaining suspects:
+
+1. **`FreqInterleaver` permutation direction.** The demap reads
+   `r[freq_interleaver.map_in(i)]`. A wrong-direction permutation
+   shuffles per-carrier soft bits to wrong positions within each
+   OFDM symbol; the byte-level statistics of the ficBlock are
+   unchanged, which is exactly the signature we see.
+2. **Per-OFDM-symbol I/Q layout.** `dqpsk_demap` emits 1536 I bits
+   then 1536 Q bits per symbol; the encoder side may pack
+   `(I0,Q0,I1,Q1,…)` instead, which would mix bits from different
+   carriers within each ficBlock.
+3. **Differential-demap conjugation direction.** `r = current *
+   conj(prev)` vs `r = conj(current) * prev`. Same magnitude, Q
+   negated; T9 (negate_second_half) would have caught this *if* the
+   half-split aligned with the I/Q split, which it almost certainly
+   doesn't because ficBlocks straddle symbol boundaries.
+
+## Slice-10 fork
+
+The next slice has to introduce sub-byte / per-carrier structure
+into the bisection. In priority order:
+
+1. **Synthetic round-trip (the slice-8 fork 2 reframed for the
+   OFDM side).** Use
+   `viterbi_unit_diff.py::make_encoded_vector` to produce a *known*
+   2304-bit FIC-encoded soft-bit ficBlock, place those bits onto
+   1536-carrier OFDM symbols with both the forward and the inverse
+   `FreqInterleaver` direction, run them through dab-rs's actual
+   `dqpsk_demap → FicProtection::deconvolve`, and check which
+   permutation direction round-trips. Definitively localises the
+   bug to the interleaver vs the demap.
+2. **Audit the I/Q packing convention against EN 300 401 §14.6
+   / §11.** Confirm whether DAB packs
+   `(I0, Q0, I1, Q1, …)` per carrier or
+   `(I0, I1, …, I_K-1, Q0, Q1, …, Q_K-1)` per OFDM symbol. dab-rs
+   uses the second; the standard text is the authority.
+3. **Differential conjugation toggle.** Synthetic two-symbol stream
+   with a known phase increment Δ; check that
+   `DifferentialReference::step` returns `r` with `arg(r) = Δ`, not
+   `-Δ`. Cheapest of all, takes ~10 lines of test code.
+4. **`docs/diag/airspy-sanity.sh`** remains orthogonally queued.
+
+(Earlier slice-9 fork list, kept for reference. The four
+upstream-of-Viterbi categories below are what slice 9 sampled
+fifteen byte-level instances of and rejected as the bug surface.)
+
+Earlier listing:
 
 1. **Soft-bit polarity bisection.** Take a single ficBlock of
    *actual* OFDM-demap output (3072 bits via slice-6 dumps), negate

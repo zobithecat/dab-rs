@@ -170,6 +170,13 @@ pub fn process_iq_to_fic(
     let mut viterbi_in_fp: Option<BufWriter<File>> = std::env::var("DAB_RS_DUMP_VITERBI_IN")
         .ok()
         .and_then(|p| File::create(&p).ok().map(BufWriter::new));
+    // Slice-9 bisection: the *pre-depuncture* OFDM demap output, 9216
+    // i8 soft bits per frame (4 ficBlocks × 2304). The demap emits
+    // values in `[-127, +127]` (slice-2 `dqpsk_demap` spec), so an
+    // i8 cast is lossless. Each frame: u32 LE frame_idx + 9216 i8.
+    let mut demap_out_fp: Option<BufWriter<File>> = std::env::var("DAB_RS_DUMP_DEMAP_OUT")
+        .ok()
+        .and_then(|p| File::create(&p).ok().map(BufWriter::new));
 
     let p = |z: &Complex<f32>| (z.re as f64).powi(2) + (z.im as f64).powi(2);
 
@@ -262,6 +269,19 @@ pub fn process_iq_to_fic(
             continue;
         }
 
+        // ---- Pre-depuncture OFDM demap dump (slice-9 bisection input) ----
+        let dab_frame_idx_pre = (result.frames_decoded as u32) + 1;
+        if let Some(fp) = demap_out_fp.as_mut() {
+            let _ = fp.write_all(&dab_frame_idx_pre.to_le_bytes());
+            // Cast each i16 demap sample to i8 — the demap guarantees the
+            // value is in [-127, +127] so truncation is lossless.
+            let bytes: Vec<u8> = frame_soft
+                .iter()
+                .map(|&v| (v as i8) as u8)
+                .collect();
+            let _ = fp.write_all(&bytes);
+        }
+
         // ---- Decode 4 ficBlocks → 384 bytes ----
         let mut dumps = DecodeDumps::default();
         let frame_bytes = decode_fic_soft_bits_with_dumps(&frame_soft, &mut dumps);
@@ -305,6 +325,9 @@ pub fn process_iq_to_fic(
         let _ = fp.flush();
     }
     if let Some(mut fp) = viterbi_in_fp {
+        let _ = fp.flush();
+    }
+    if let Some(mut fp) = demap_out_fp {
         let _ = fp.flush();
     }
 
