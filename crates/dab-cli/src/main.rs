@@ -114,6 +114,23 @@ enum Command {
     /// synthetic test vector can be piped to both binaries and the
     /// outputs bit-XOR'd by `docs/diag/viterbi_unit_diff.py`.
     ViterbiCli,
+    /// Slice-10 synthetic OFDM round-trip harness. Reads 3 × 2048
+    /// `Complex<f32>` differential spectra from stdin (49 152 bytes
+    /// total — three 2048-bin natural-order FFT outputs as little-
+    /// endian `re, im` f32 pairs), runs the *actual* dab-rs chain:
+    ///
+    ///   dqpsk_demap.demap(diff)               × 3 symbols
+    ///   → 9216 i16 soft bits
+    ///   → 4 × FicProtection::deconvolve       per ficBlock
+    ///   → 3072 info bits
+    ///   → descramble + MSB-first pack         → 384 bytes
+    ///
+    /// Writes 384 bytes (12 FIBs) to stdout. Python harness on the
+    /// other side (`docs/diag/synth_ofdm.py`) generates the synthetic
+    /// spectra under a configurable
+    /// `(p1=interleaver_dir, p2=iq_layout, p3=conj_dir)` triple and
+    /// checks the recovered FIB CRC.
+    SynthTest,
 }
 
 fn main() -> Result<()> {
@@ -132,7 +149,42 @@ fn main() -> Result<()> {
             dab_cli::diag_ibits::dump_pair(&iq, m, &oracle, frame, symbol, show)
         }
         Command::ViterbiCli => run_viterbi_cli(),
+        Command::SynthTest => run_synth_test(),
     }
+}
+
+fn run_synth_test() -> Result<()> {
+    use std::io::{Read, Write};
+    use num_complex::Complex;
+    const T_U: usize = 2048;
+    const N_SYMS: usize = 3;
+    const SPEC_BYTES: usize = T_U * 8; // 2 × f32 LE per bin
+    let mut buf = vec![0_u8; N_SYMS * SPEC_BYTES];
+    std::io::stdin()
+        .read_exact(&mut buf)
+        .map_err(|e| anyhow::anyhow!("stdin: expected {} bytes ({e})", N_SYMS * SPEC_BYTES))?;
+
+    let demap = dab_ofdm::DqpskDemap::mode_i();
+    let mut frame_soft: Vec<i16> = Vec::with_capacity(9216);
+    for s in 0..N_SYMS {
+        let mut spec: Vec<Complex<f32>> = Vec::with_capacity(T_U);
+        let off = s * SPEC_BYTES;
+        for k in 0..T_U {
+            let re = f32::from_le_bytes(buf[off + k * 8..off + k * 8 + 4].try_into().unwrap());
+            let im =
+                f32::from_le_bytes(buf[off + k * 8 + 4..off + k * 8 + 8].try_into().unwrap());
+            spec.push(Complex::new(re, im));
+        }
+        let bits = demap.demap(&spec);
+        frame_soft.extend_from_slice(&bits);
+    }
+    assert_eq!(frame_soft.len(), 9216);
+    let frame_bytes = dab_cli::fic_iq::decode_fic_soft_bits_to_bytes(&frame_soft);
+    assert_eq!(frame_bytes.len(), 384);
+    std::io::stdout()
+        .write_all(&frame_bytes)
+        .map_err(|e| anyhow::anyhow!("stdout: {e}"))?;
+    Ok(())
 }
 
 fn run_viterbi_cli() -> Result<()> {

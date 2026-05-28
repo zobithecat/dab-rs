@@ -724,34 +724,144 @@ remaining suspects:
    half-split aligned with the I/Q split, which it almost certainly
    doesn't because ficBlocks straddle symbol boundaries.
 
-## Slice-10 fork
+## Tenth-iteration findings (2026-05-29, synthetic round-trip ↦ Result S, pivot)
 
-The next slice has to introduce sub-byte / per-carrier structure
-into the bisection. In priority order:
+Slice 10 ran the slice-9 fork-1 synthetic round-trip: encode 3072
+known info bits → FIC mother + puncture → place onto 1536-carrier
+OFDM differential spectra under a `(p1, p2, p3) = (interleaver_dir,
+iq_layout, conj_dir)` triple → pipe directly into a new
+`dab synth-test` subcommand that runs *only* the post-OFDM-sync
+chain (`dqpsk_demap → FicProtection::deconvolve → descramble →
+pack`) → recover the info bits and compare.
 
-1. **Synthetic round-trip (the slice-8 fork 2 reframed for the
-   OFDM side).** Use
-   `viterbi_unit_diff.py::make_encoded_vector` to produce a *known*
-   2304-bit FIC-encoded soft-bit ficBlock, place those bits onto
-   1536-carrier OFDM symbols with both the forward and the inverse
-   `FreqInterleaver` direction, run them through dab-rs's actual
-   `dqpsk_demap → FicProtection::deconvolve`, and check which
-   permutation direction round-trips. Definitively localises the
-   bug to the interleaver vs the demap.
-2. **Audit the I/Q packing convention against EN 300 401 §14.6
-   / §11.** Confirm whether DAB packs
-   `(I0, Q0, I1, Q1, …)` per carrier or
-   `(I0, I1, …, I_K-1, Q0, Q1, …, Q_K-1)` per OFDM symbol. dab-rs
-   uses the second; the standard text is the authority.
-3. **Differential conjugation toggle.** Synthetic two-symbol stream
-   with a known phase increment Δ; check that
-   `DifferentialReference::step` returns `r` with `arg(r) = Δ`, not
-   `-Δ`. Cheapest of all, takes ~10 lines of test code.
-4. **`docs/diag/airspy-sanity.sh`** remains orthogonally queued.
+New infrastructure
+- `crates/dab-cli/src/main.rs::SynthTest` — hidden subcommand reading
+  3 × 2048 `Complex<f32>` differential spectra (49 152 bytes) from
+  stdin, running dab-rs's *actual* demap + FIC pipeline, writing 384
+  bytes (12 FIBs) to stdout. Skips OFDM sync / NCO / FFT entirely.
+- `docs/diag/synth_ofdm.py` — DAB rate-1/4 mother encoder + FIC
+  puncture table + per-axis configurable synthesiser, plus an
+  8-config sweep harness.
 
-(Earlier slice-9 fork list, kept for reference. The four
-upstream-of-Viterbi categories below are what slice 9 sampled
-fifteen byte-level instances of and rejected as the bug surface.)
+Sweep result (seed 42 → 3072 random LCG info bits)
+
+| p1      | p2          | p3              | CRC /12 | info-bit match           |
+| ------- | ----------- | --------------- | ------: | ------------------------ |
+| forward | block       | curr_conj_prev  |   0     | **3072 / 3072 = 1.0000** |
+| forward | block       | conj_curr       |   0     | 2344 / 3072 = 0.7630     |
+| forward | interleaved | curr_conj_prev  |   0     | 1543 / 3072 = 0.5023     |
+| forward | interleaved | conj_curr       |   0     | 1545 / 3072 = 0.5029     |
+| inverse | block       | curr_conj_prev  |   0     | 1583 / 3072 = 0.5153     |
+| inverse | block       | conj_curr       |   0     | 1536 / 3072 = 0.5000     |
+| inverse | interleaved | curr_conj_prev  |   0     | 1547 / 3072 = 0.5036     |
+| inverse | interleaved | conj_curr       |   0     | 1502 / 3072 = 0.4889     |
+
+**Result S — `(forward, block, curr_conj_prev)` round-trips at 100 %
+info-bit recovery; this is exactly the configuration dab-rs already
+uses.**
+
+The `CRC pass = 0/12` column is an artefact of the input being
+random LCG bits with no real FIB CRC trailers — the test is the
+info-bit match, not the CRC. All other configurations collapse to
+the ~50 % random baseline or, for `conj_curr` (Q-only sign flip),
+to ~76 % (half the bits flipped + Viterbi error correction salvages
+some structure).
+
+### Pivot: the bug is in OFDM stages 1–6, *not* the chain we kept
+suspecting
+
+This refutes every "upstream of Viterbi" hypothesis slices 6–9
+raised:
+
+- The frequency de-interleaver direction is correct (P1 = forward).
+- The I-block-then-Q-block layout per OFDM symbol is correct
+  (P2 = block).
+- The differential conjugation direction is correct
+  (P3 = `r = current * conj(prev)`).
+- dab-viterbi was already cleared in slice 8.
+- The FIC depuncture table geometry round-trips (slice 8 + 10).
+- The descrambler PRBS and the MSB-first FIB packing round-trip.
+
+So the 0 / 2496 FIB CRC failure on `k8b_v4.iq` is *not* in
+`dqpsk_demap`, `FicProtection`, `dab_descramble`, `dab_fic`, *or* the
+FIC puncture table. It has to be in the steps that *produce* the
+differential spectra in the first place — i.e. OFDM stages 1–6 in
+`dab-ofdm` and the per-frame loop in `fic_iq`. Most plausible:
+
+1. **Sub-sample timing drift symbol-to-symbol.** If
+   `CpSync::fine_time` or the per-symbol offset accumulation drifts
+   by a fraction of a sample between consecutive symbols, the FFT
+   bins pick up a slowly-changing linear-phase ramp; the per-bin
+   differential cancels a *constant* ramp but not a drifting one.
+   The soft-bit statistics still look healthy (slice 5) because
+   |r| ≈ const across bins, only `arg(r)` drifts; the demap reads
+   `re(r)` and `im(r)` which then carry information from *adjacent*
+   carriers' phase relationships rather than the encoded a/b bit
+   pair.
+2. **Fractional-CFO estimate sign or scale.** `mix(-cfo_hz)` removes
+   `+cfo_hz`; if the sign convention or the magnitude doubling /
+   halving inherited from `CpSync::estimate_cfo_hz` is off,
+   consecutive symbols see different residual rotations and the
+   differential carries the residual difference, not the encoded
+   phase increment.
+3. **Integer CFO rotation per frame.** `detect_integer_cfo` is gated
+   by a peak-vs-runner-up confidence (`> 1.5×`), so on noisy frames
+   it defaults to `δ = 0`. If the actual integer CFO is non-zero
+   but the detector falls back to 0, all 1536 carriers' bits are
+   read from the wrong bins, every frame.
+4. **NCO phase accumulation across symbols.** If
+   `Nco::new(FS).mix(...)` resets the phase between PRS and data
+   symbols of the same frame, the differential between PRS and the
+   first data symbol carries a wrong constant rotation; subsequent
+   differentials cancel it but the *first* FIB chunk is corrupt
+   every frame.
+
+Each is a separate cheap test. Slice 11 should bisect.
+
+## Slice-11 fork
+
+Slice 10 cleared every downstream-of-OFDM hypothesis. The bug lives
+in dab-ofdm stages 1–6 (the per-frame loop that *produces* the
+differential spectra), not in `dqpsk_demap` or the FIC chain. Four
+cheap bisections, in priority order:
+
+1. **Per-symbol differential `arg(r)` consistency check.** Feed two
+   adjacent synthetic OFDM data symbols with a known phase increment
+   Δ on each carrier into the real dab-ofdm chain
+   (`SymbolFft → DifferentialReference::step`) and confirm that
+   `arg(r) = Δ` for every active carrier within float-precision
+   noise. Any per-carrier drift away from Δ is the bug surface. The
+   2D heatmap of `arg(r) − Δ` over (carrier_index, symbol_index)
+   should localise to either a sample-timing-drift signature
+   (linear in carrier) or a CFO-residual signature (uniform across
+   carriers).
+2. **NCO phase carry between PRS and the first data symbol of a
+   frame.** Today `fic_iq` constructs a fresh `Nco::new(FS)` for
+   every `fft_symbol_corrected` call. If `Nco` is supposed to carry
+   phase across PRS → data1, the first ficBlock in every frame sees
+   a wrong constant rotation. Cheapest check: re-use one `Nco`
+   instance across PRS + 75 data symbols of a frame and re-run
+   `dab fic-iq`; if FIB CRC pass goes from 0 to non-zero, the
+   per-call phase reset is the bug.
+3. **Per-frame `cp.fine_time` reliability.** The current pipeline
+   picks the PRS start once per frame from a null position; if that
+   sample index is off by even one sample, the FFT of the first
+   data symbol gets a linear-phase ramp that the differential
+   against the PRS *does not* cancel. Compare the per-frame
+   `prs_start` against a sliding-window correlation peak and check
+   whether they ever disagree by ±1 sample.
+4. **Fractional CFO sign / scale.** `mix(-cfo_hz)` is supposed to
+   remove `+cfo_hz`. Verify on a synthetic CFO tone that
+   `CpSync::estimate_cfo_hz` returns the *signed* offset and that
+   `Nco::mix(-cfo_hz)` actually cancels it. A factor-of-2 or
+   sign error here would corrupt every symbol's phase.
+
+Each test is bounded in scope and can be a separate slice. The
+heatmap in #1 is the most informative; the carry test in #2 is the
+cheapest to *try the fix and re-measure FIB CRC end-to-end*.
+
+(Earlier slice-9 / slice-10 fork lists, kept below for reference.
+Both have been refuted by slice 10's synthetic round-trip.)
 
 Earlier listing:
 
