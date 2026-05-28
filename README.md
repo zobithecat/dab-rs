@@ -107,8 +107,8 @@ target); Week 1 additionally reproduces the Python
 | Stage | Scope                              | Oracle                              | Status                                            |
 | ----- | ---------------------------------- | ----------------------------------- | ------------------------------------------------- |
 | A     | Outer FEC + ETI/MSC + FIC          | Python `airspy-mini-dmb` + `.eti`   | ✅ byte-identical (87.3 % RS; ensemble "YTN DMB") |
-| B     | Inner FEC (Viterbi + descramble)   | `eti-stuff` intermediate dump       | ⬜ deferred — needs raw I/Q or OFDM soft bits     |
-| C     | OFDM core                          | K8B raw I/Q + `eti-stuff` per-symbol | 🔨 stages 1–7 black-box validated on `k8b_v4.iq`; byte-identical end-to-end next |
+| B     | Inner FEC (Viterbi + descramble)   | `eti-stuff` intermediate dump       | 🔨 wired via `dab fic-iq` on real I/Q but currently produces 0/2496 valid FIBs — see *Discovered subtleties* #7 |
+| C     | OFDM core                          | K8B raw I/Q + `eti-stuff` per-symbol | 🔨 stages 1–7 black-box validated on `k8b_v4.iq`; byte-identical end-to-end blocked on Stage B |
 
 > A 20 s K8B raw I/Q capture (`k8b_rust.iq`, INT16_IQ @ 3 MSPS, in the
 > `airspy-mini-dmb` repo under Git LFS) now exists and drives the Stage C
@@ -180,6 +180,25 @@ contributor (or the next paper reviewer) deserves to know up front.
   threshold** `p1 + 0.30·(p99 − p1)` over the smoothed envelope, which
   recovers the 96 ms cadence cleanly even at ~7 dB SNR. The shallow-null
   case is covered by a dedicated unit test.
+
+- **`dab-viterbi` is currently only self-consistent, not validated against
+  a real DAB stream** *(Week 2 → Week 3e investigation)*. The scalar Viterbi
+  decoder and its `convolutional_encode` test utility round-trip cleanly,
+  but the round-trip says nothing about whether the decoder inverts the
+  *actual* DAB transmitter's encoder. The eti-stuff oracle picked
+  `viterbiSpiral` for every active decoding path: in `eep-protection.cpp`
+  and `uep-protection.cpp` the scalar `viterbiHandler::deconvolve` calls
+  are commented out, and `ficHandler` derives directly from `viterbiSpiral`.
+  The spiral uses bit-reversed polynomials (`{0o155, 0o117, 0o123, 0o155}`)
+  in its internal representation — the comment in `viterbi-spiral.cpp`
+  explicitly notes "in the reversed form the polys look { 0133, 0171,
+  0145, 0133 }". The current `dab-viterbi` is a port of the scalar
+  `viterbiHandler` and emits 0/2496 valid FIBs on the `k8b_v4.iq` oracle
+  even when the upstream OFDM soft bits are healthy
+  (`crates/dab-cli/tests/k8b_v4_fic_iq.rs`). Resolution requires either a
+  faithful port of `viterbiSpiral` or instrumenting eti-stuff with
+  `HAVE_DUMPING` to cross-check Viterbi input bits and confirm the encoder
+  convention.
 
 - **Airspy AGC (`-G 0`) is sub-optimal for marginal indoor SNR**
   *(planned, `dab-iq-airspy`).* On the same indoor K8B antenna setup, a

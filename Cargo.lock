@@ -122,10 +122,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dab-descramble",
  "dab-eti",
  "dab-fec",
  "dab-fic",
+ "dab-iq",
  "dab-msc",
+ "dab-ofdm",
+ "dab-viterbi",
+ "num-complex",
  "tracing",
  "tracing-subscriber",
 ]

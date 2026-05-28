@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 description = "dab-rs CLI: I/Q -> ETI / FIC / MSC decode."
 
+[lib]
+name = "dab_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "dab"
 path = "src/main.rs"
@@ -17,6 +21,11 @@ dab-eti.workspace = true
 dab-msc.workspace = true
 dab-fec.workspace = true
 dab-fic.workspace = true
+dab-iq.workspace = true
+dab-ofdm.workspace = true
+dab-viterbi.workspace = true
+dab-descramble.workspace = true
+num-complex.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

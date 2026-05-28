@@ -12,17 +12,19 @@
 //! Soft-bit convention (from the oracle): `i16`, where `-255 => bit 1` and
 //! `+255 => bit 0`.
 //!
-//! Scope: only the scalar Viterbi (`viterbiHandler`) and Equal Error Protection
-//! (EEP) depuncturing are ported. The SIMD `viterbiSpiral` variant, UEP
-//! (Unequal Error Protection), and FIC-specific puncturing are intentionally
-//! deferred.
+//! Scope: scalar Viterbi (`viterbiHandler`), Equal Error Protection (EEP)
+//! depuncturing, and FIC-specific depuncturing are ported. The SIMD
+//! `viterbiSpiral` variant and UEP (Unequal Error Protection) are
+//! intentionally deferred.
 #![forbid(unsafe_code)]
 
 mod eep;
+mod fic;
 mod tables;
 mod viterbi;
 
 pub use eep::EepProtection;
+pub use fic::{FicProtection, FIC_IN_BITS, FIC_OUT_BITS, FIC_VITERBI_LEN};
 pub use tables::{p_codes, P_CODES};
 pub use viterbi::{bit_for, convolutional_encode, Viterbi, K, POLYS};
 
