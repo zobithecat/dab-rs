@@ -258,27 +258,80 @@ The resampler is run *once* by `dab convert-iq` and its output is
 consumed identically by both pipelines via the WAV file, so it cannot
 itself be a source of dab-rs vs oracle divergence.
 
-## Next-slice fork
+## Fourth-iteration findings (2026-05-28, wav32 + scale-hypothesis disproof)
 
-Three concrete options, in order of preference:
+Slice 4 implemented Fork 1: `dab convert-iq --out wav32` writes
+`SF_FORMAT_WAV | SF_FORMAT_FLOAT` with samples pre-scaled by ×16 so the
+float values libsndfile passes through `sf_readf_float` match the
+amplitude `airspy-handler.cpp:337`'s `sample / 2048` would have fed
+the OFDM processor on the live path. The new mode is unit-tested
+(`wav32_scale_matches_airspy_handler`) and the resulting file's
+amplitude is verified by sampling 1 M I/Q pairs:
 
-1. **32-bit float WAV with airspy-handler-equivalent scaling.** Write
-   `SF_FORMAT_WAV | SF_FORMAT_FLOAT` with samples pre-scaled to match
-   airspy-handler's `/2048` output (no 16-bit-PCM clipping issue since
-   floats can carry values > 1). Most likely to make the offline oracle
-   behave the same as the live one.
-2. **Patch `wavfile-handler.cpp` to multiply by 16 after libsndfile**
-   reads, instead of changing the writer. Equivalent in effect, larger
-   change to eti-stuff.
-3. **Use `dab fic-iq` on the WAV input directly.** Skip the oracle
-   altogether for the byte-identical step; instead validate
-   dab-rs against the live `k8b_v4.eti` by feeding the same WAV through
-   our pipeline and comparing the FIB CRC pass rate or ensemble model
-   to the live capture's metadata.
+| metric | wav32 measured | expected (airspy-handler scale) |
+| ------ | --------------:| -------------------------------:|
+| p50    | 0.885          | 1807/2048 ≈ 0.882               |
+| p90    | 2.187          | 4463/2048 ≈ 2.179               |
+| p99    | 3.446          | 7018/2048 ≈ 3.427               |
+| max    | 6.604          | 12940/2048 ≈ 6.318              |
 
-The infrastructure (patched eti-stuff with four dump channels,
-`dab convert-iq --out wav`, `dab diag-ibits`, `dab diag-pair`) is all
-in place — the next slice picks one of the three forks and exercises it.
+So the wav32 file is correctly scaled. The hypothesis is testable, and:
+
+**Result: oracle still produces 0-byte ETI, and `coarseCorrector`'s
+per-frame trace is byte-identical to the 16-bit-PCM wav run.**
+
+```
+fineCorrector   : mean -191, stdev 94, range [-342, +83]      (identical to wav)
+coarseCorrector : mean -1477, stdev 16988, range [-33k, +33k] (identical to wav)
+```
+
+The scale-invariance is *not* coincidence — the OFDM processor's CFO
+loop only uses phase correlations (look back at `phasereference.cpp::
+estimateOffset`: only `arg()` differences) and adaptive-mean envelope
+thresholds (null detector), both of which are amplitude-scale-invariant
+by construction. dab-rs's chain is the same way: `dab diag-ibits` on
+the wav32 oracle dump still reports match rate 0.42 % (random baseline).
+
+**Conclusion**: The amplitude / precision differences between the live
+and offline input paths are *not* responsible for oracle's failure.
+The hypothesis is empirically disproved.
+
+What we know for certain after slice 4:
+
+- The OFDM CFO loop on the offline path produces wildly unstable
+  `coarseCorrector` (stdev > 16 k Hz, range ±33 kHz) on this capture,
+  *regardless* of input format (cu8, 16-bit PCM, 32-bit float).
+- The same compiled `eti-cmdline-airspy` does succeed live on the same
+  RF input, producing `k8b_v4.eti` with 5 services. So the OFDM chain
+  itself is not broken — something about the live-vs-offline plumbing
+  differs in a way the CFO loop is sensitive to.
+- dab-rs and the oracle agree on the *statistics* of soft bits
+  (mean |b| = 63/127, balanced pos/neg) but disagree on absolute
+  values at random-baseline rate. This is consistent with both
+  pipelines independently making different CFO decisions on the same
+  unstable input.
+
+## Slice-5 fork
+
+The remaining options are now:
+
+1. **Investigate the live-vs-offline difference.** Compare libairspy's
+   `INT16_IQ` callback output (what airspy-handler sees) byte-for-byte
+   against airspy_rx's saved cs16le file. If they differ, libairspy's
+   internal state-machine emits different samples in the two modes.
+2. **Try a different capture.** Run the offline pipeline on
+   `k8b_strong.iq` or `k8b_v3` (other K8B captures) to see if oracle
+   coarseCorrector stabilises on any saved capture.
+3. **Bypass oracle.** Validate dab-rs against the live `k8b_v4.eti`
+   directly via `dab fic-iq`, comparing ensemble model + FIB CRC pass
+   rate to the live capture metadata. No oracle re-run needed.
+4. **Patch eti-stuff offline plumbing**. Bisect by hard-coding
+   `coarseCorrector = 0` (or copy-pasting in dab-rs's per-frame
+   estimates) and re-running the oracle to see if downstream still
+   works.
+
+Fork 3 is the cheapest path to a *functional* validation answer. Forks
+1, 2, 4 are deeper investigations into oracle's offline behaviour.
 
 ## Closing the patch
 

@@ -51,19 +51,25 @@ enum Command {
     /// Resample a `Cs16Le @ 3 MSPS` capture to 2.048 MSPS and emit it in a
     /// format an eti-stuff offline input handler can consume.
     ///
-    /// `--out cu8`  → `(uint8 I, uint8 Q)` for `eti-cmdline-rawfiles`.
-    /// `--out wav`  → 16-bit PCM stereo WAV for `eti-cmdline-wavfiles`
-    ///                (preserves the source 12-bit precision through to
-    ///                the oracle; the cu8 path drops ~3 effective bits on
-    ///                the K8B capture and starves the oracle's coarse-CFO
-    ///                loop).
+    /// `--out cu8`    → `(uint8 I, uint8 Q)` for `eti-cmdline-rawfiles`.
+    /// `--out wav`    → 16-bit PCM stereo WAV for `eti-cmdline-wavfiles`
+    ///                  (still 16× too small in amplitude vs the live
+    ///                  airspy-handler path — empirically breaks the
+    ///                  oracle's coarse-CFO lock).
+    /// `--out wav32`  → 32-bit IEEE float stereo WAV for
+    ///                  `eti-cmdline-wavfiles`, samples pre-scaled by
+    ///                  ×16 so the OFDM processor sees the exact same
+    ///                  amplitude the live oracle saw — the path that
+    ///                  matches the live `eti-cmdline-airspy` numerics
+    ///                  bit-for-bit.
     ConvertIq {
         /// Input `Cs16Le @ 3 MSPS` capture.
         input: PathBuf,
         /// Output file.
         output: PathBuf,
-        /// `cu8` or `wav` (default `wav`).
-        #[arg(long, default_value = "wav")]
+        /// `cu8`, `wav` (16-bit PCM), or `wav32` (32-bit float,
+        /// airspy-scaled). Default: `wav32`.
+        #[arg(long, default_value = "wav32")]
         out: String,
     },
     /// Cross-validate dab-rs's per-symbol soft bits against an oracle dump
@@ -157,7 +163,11 @@ fn run_convert_iq(
             let p = dab_cli::convert_iq::convert_cs16_3m_to_wav_2048k(input, output)?;
             (p, 4_usize, "WAV 16-bit PCM stereo")
         }
-        other => anyhow::bail!("unsupported --out {other} (use cu8 or wav)"),
+        "wav32" => {
+            let p = dab_cli::convert_iq::convert_cs16_3m_to_wav32_2048k(input, output)?;
+            (p, 8_usize, "WAV 32-bit float stereo (airspy-scaled)")
+        }
+        other => anyhow::bail!("unsupported --out {other} (use cu8, wav, or wav32)"),
     };
     let bytes = pairs * bytes_per_pair;
     let mb = bytes as f64 / (1024.0 * 1024.0);
