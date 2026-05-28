@@ -376,27 +376,130 @@ prints distribution stats, and documents the manual airspy-handler
 patch needed for the full file-vs-callback diff. Hardware-bound; can
 be run independently of dab-rs.
 
-## Slice-6 fork
+## Sixth-iteration findings (2026-05-28, FIB-bit XOR diff localises bug)
 
-The remaining options are now:
+Slice 6 ran the bit-by-bit XOR-diff lane: extract the live ETI's real
+FIB bytes (per slice-6-Part-A: each 24 ms ETI frame has 4 FIB slots,
+slots 0–2 are real and slot 3 is always-fail padding), dump dab-rs's
+chain intermediates at each module boundary, and bit-XOR against the
+ground truth.
 
-1. **Investigate the live-vs-offline difference.** Compare libairspy's
-   `INT16_IQ` callback output (what airspy-handler sees) byte-for-byte
-   against airspy_rx's saved cs16le file. If they differ, libairspy's
-   internal state-machine emits different samples in the two modes.
-2. **Try a different capture.** Run the offline pipeline on
-   `k8b_strong.iq` or `k8b_v3` (other K8B captures) to see if oracle
-   coarseCorrector stabilises on any saved capture.
-3. **Bypass oracle.** Validate dab-rs against the live `k8b_v4.eti`
-   directly via `dab fic-iq`, comparing ensemble model + FIB CRC pass
-   rate to the live capture metadata. No oracle re-run needed.
-4. **Patch eti-stuff offline plumbing**. Bisect by hard-coding
-   `coarseCorrector = 0` (or copy-pasting in dab-rs's per-frame
-   estimates) and re-running the oracle to see if downstream still
-   works.
+### Part A — FIB-per-frame mismatch resolved
 
-Fork 3 is the cheapest path to a *functional* validation answer. Forks
-1, 2, 4 are deeper investigations into oracle's offline behaviour.
+A Python sweep over 500 ETI frames of `k8b_v4.eti` confirms:
+
+| ETI slot | CRC pass rate | First-byte top-3 (count)              |
+| -------- | -------------:| ------------------------------------- |
+| 0        | 500 / 500     | 0x05×125, 0x1d×125, 0x08×125          |
+| 1        | 500 / 500     | 0xff×226, 0x1b×125, 0x15×125          |
+| 2        | 500 / 500     | 0xff×440, 0x37×36,  0x0a×12           |
+| 3        | **0 / 500**   | 0xff×140, 0x47×30,  0x00×11           |
+
+Slot 3 is the always-fail padding slot. That makes the 75.0 % live pass
+rate near-100 % of the real FIBs (`live 7517 ≈ 7518 = 2506 frames × 3
+real`). dab-rs's 12 FIBs / 96 ms DAB frame map cleanly to live ETI's
+4 × 3 = 12 real FIBs spanning four 24-ms ETI frames — no
+"3× discrepancy". The slice-5 anomaly is closed.
+
+Frame alignment for the bit-diff:
+
+```text
+dab_rs DAB frame M, FIB[k]  ↔  live ETI frame [base_off + M*4 + k//3], slot[k%3]
+                                where k = 0..11, slot ∈ {0, 1, 2} (skipping padding slot 3)
+```
+
+### Part B — XOR diff at each module boundary
+
+New env-gated dumps in `dab fic-iq`:
+
+- `DAB_RS_DUMP_VITERBI_OUT` — per-frame pre-descramble Viterbi output
+  bits (3072 bit-per-byte). 4-byte LE `frame_idx` header per record.
+- `DAB_RS_DUMP_DESCRAMBLED` — per-frame post-descramble bits. Same
+  layout. XOR of the two gives the FIC PRBS sequence directly,
+  cross-checking the descrambler from the outside.
+
+`docs/diag/viterbi_bits_diff.py` reads the live ETI's real FIBs,
+unpacks them into a `[0/1; 256]` bit array per FIB, reads either dump,
+sweeps `base_offset ∈ [-30, +30]` DAB frames to absorb sync skew, picks
+the offset that maximises exact-bit matches, and reports the diff
+distribution across the 256 FIB-bit positions.
+
+**Result on `k8b_v4.iq`** (208 DAB frames vs 7 518 real ETI FIBs):
+
+```
+[viterbi_out] best_offset=0   bit_match = 320 278 / 638 976  = 0.5012  (random baseline = 0.5)
+[descrambled] best_offset=6   bit_match = 320 182 / 638 976  = 0.5011  (random baseline = 0.5)
+```
+
+The per-bit-position histogram is **uniformly 0.50 across every one
+of the 256 positions**, with no offset improving the match rate above
+the random floor at any sweep value. The first-FIB side-by-side
+confirms it visually:
+
+```
+live   :  11111111 00000000 00000000 00000000 …   (0xFF + zero padding — deterministic)
+dab_rs :  11110111 00110000 01011111 00000001 …   (uncorrelated noise)
+```
+
+### Diagnosis
+
+- **The Viterbi output bit-stream is independent of the input.** All
+  256 bit positions diff at 50 %, every offset gives the same rate,
+  no permutation / sign-flip / endianness tweak helps.
+- **descrambled is just as random.** The descrambler is doing what
+  it's documented to (deterministic PRBS XOR), but its input is
+  already garbage, so the output is garbage too.
+- Since dab-rs OFDM Stage 1–7 was independently validated as
+  functionally correct (slice 5: 208 / 208 frames decoded with healthy
+  soft-bit statistics), the bug sits in **dab-viterbi's
+  `FicProtection::deconvolve` or the underlying scalar Viterbi**.
+- This bit-pattern signature (random everywhere, every offset) is the
+  unambiguous fingerprint of *gotcha #7* finally biting us. The
+  scalar Viterbi in `dab-viterbi` round-trips with its own
+  `convolutional_encode` and is therefore self-consistent, but its
+  internal bit-ordering / state-machine convention does *not* invert
+  the real DAB transmitter's encoder. The trellis converges on a
+  state path that is statistically unrelated to the transmitted info
+  bits.
+- This also matches what slice 3 already noted from the eti-stuff
+  source: `viterbiHandler::deconvolve` (the scalar variant
+  `dab-viterbi` ports) is **commented out** at every active call site;
+  the FIC and EEP/UEP chains all derive from `viterbiSpiral`, which
+  uses bit-reversed polynomials `{0o155, 0o117, 0o123, 0o155}` in its
+  internal representation. The scalar variant has not been
+  battle-tested on a real DAB stream, and our diagnostic just produced
+  the first hard evidence that it is incorrect.
+
+## Slice-7 fork
+
+Bug now localised to `dab-viterbi`. Options in priority order:
+
+1. **Port `viterbiSpiral` to Rust** as a new `dab-viterbi` backend or a
+   sibling crate. The spiral variant is what every active eti-stuff path
+   uses (FIC, EEP, UEP all derive from `viterbiSpiral`; the scalar
+   `viterbiHandler` is commented out everywhere). It uses bit-reversed
+   polynomials `{0o155, 0o117, 0o123, 0o155}` and a different internal
+   state representation — it is plausible that this *is* the convention
+   the DAB transmitter encodes against, and that's why eti-stuff
+   doesn't ship a working scalar fall-back. Roughly ~250 LOC port from
+   `viterbi-spiral.cpp` (no SIMD intrinsics needed for correctness — a
+   scalar Rust translation will match bit-for-bit).
+2. **Bit-stream-level cross-check first.** Before porting, instrument
+   eti-stuff's `viterbiSpiral::deconvolve` with a `DAB_RS_DUMP_VITERBI_IN`
+   / `_OUT` pair and run it on the same `k8b_v4_2048k.wav32` to capture
+   its actual 2304-soft-bit input + 768-decoded-bit output per ficBlock.
+   Then bit-XOR against `dab-viterbi`'s output on the same input. If the
+   inputs match but outputs differ, dab-viterbi is wrong; if the inputs
+   *also* differ, the upstream OFDM bit-ordering inside the demap loop
+   needs auditing too.
+3. **Sanity-check FIC depuncturing.** Less likely but cheap: dump the
+   3096-bit mother codeword after depuncturing on both sides and diff.
+   If those match, the puncturing tables are fine and Viterbi is the
+   only candidate left.
+4. **Run the airspy hardware sanity script** (`docs/diag/airspy-sanity.sh`)
+   in parallel — its result is orthogonal to the Viterbi fix but
+   resolves the still-open question of whether the oracle's offline
+   handlers diverge from the live path independent of dab-viterbi.
 
 ## Closing the patch
 

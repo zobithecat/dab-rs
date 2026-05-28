@@ -103,6 +103,15 @@ pub struct FicIqResult {
 /// describe its on-disk layout (the in-tree `airspy-mini-dmb` captures are
 /// `Cs16Le` at `3_000_000`). The output is an aggregate `FicIqResult` with
 /// the populated ensemble and accumulated FIB statistics.
+///
+/// Diagnostic dumps are opt-in via env vars (same pattern as the eti-stuff
+/// patches in `docs/diag/eti-stuff-ibits-dump.patch`):
+///
+/// - `DAB_RS_DUMP_VITERBI_OUT` — per-frame pre-descramble Viterbi output
+///   (3072 bytes, bit-per-byte; preceded by a 4-byte LE `frame_idx`).
+/// - `DAB_RS_DUMP_DESCRAMBLED` — per-frame post-descramble bits, same
+///   layout. XOR of the two gives the frame's PRBS (proves the descrambler
+///   is doing what's documented).
 pub fn process_iq_to_fic(
     iq_path: &Path,
     input_format: IqFormat,
@@ -143,6 +152,16 @@ pub fn process_iq_to_fic(
         null_dips: nulls.positions.len(),
         ..FicIqResult::default()
     };
+
+    // ---- env-gated diagnostic dumps (see docstring) ----
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+    let mut viterbi_fp: Option<BufWriter<File>> = std::env::var("DAB_RS_DUMP_VITERBI_OUT")
+        .ok()
+        .and_then(|p| File::create(&p).ok().map(BufWriter::new));
+    let mut descrambled_fp: Option<BufWriter<File>> = std::env::var("DAB_RS_DUMP_DESCRAMBLED")
+        .ok()
+        .and_then(|p| File::create(&p).ok().map(BufWriter::new));
 
     let p = |z: &Complex<f32>| (z.re as f64).powi(2) + (z.im as f64).powi(2);
 
@@ -236,8 +255,22 @@ pub fn process_iq_to_fic(
         }
 
         // ---- Decode 4 ficBlocks → 384 bytes ----
-        let frame_bytes = decode_fic_soft_bits_to_bytes(&frame_soft);
+        let mut dumps = DecodeDumps::default();
+        let frame_bytes = decode_fic_soft_bits_with_dumps(&frame_soft, &mut dumps);
         debug_assert_eq!(frame_bytes.len(), FIC_BYTES_PER_FRAME);
+
+        // Persist optional intermediate-stage dumps. Header per frame:
+        // u32 LE frame_idx (1-based, matches the oracle dump convention),
+        // then 3072 bytes of bit-per-byte (4 ficBlocks × 768 info bits).
+        let dab_frame_idx = (result.frames_decoded as u32) + 1;
+        if let Some(fp) = viterbi_fp.as_mut() {
+            let _ = fp.write_all(&dab_frame_idx.to_le_bytes());
+            let _ = fp.write_all(&dumps.viterbi_out);
+        }
+        if let Some(fp) = descrambled_fp.as_mut() {
+            let _ = fp.write_all(&dab_frame_idx.to_le_bytes());
+            let _ = fp.write_all(&dumps.descrambled);
+        }
 
         // ---- Feed to the accumulator ----
         let prior_total = acc.fib_total;
@@ -246,6 +279,13 @@ pub fn process_iq_to_fic(
         result.fib_total += acc.fib_total - prior_total;
         result.fib_ok += acc.fib_ok - prior_ok;
         result.frames_decoded += 1;
+    }
+
+    if let Some(mut fp) = viterbi_fp {
+        let _ = fp.flush();
+    }
+    if let Some(mut fp) = descrambled_fp {
+        let _ = fp.flush();
     }
 
     result.ensemble = acc.ensemble;
@@ -290,6 +330,32 @@ fn rotate_spectrum(spec: &[Complex<f32>], delta: i32) -> Vec<Complex<f32>> {
 /// concatenate to a single 384-byte (12 FIB) per-frame buffer. Exposed for
 /// tests that want to feed synthetic soft bits directly.
 pub fn decode_fic_soft_bits_to_bytes(frame_soft: &[i16]) -> Vec<u8> {
+    decode_fic_soft_bits_with_dumps(frame_soft, &mut DecodeDumps::default())
+}
+
+/// Optional intermediate-stage dump buffers for the FIC decode pipeline.
+///
+/// Each field, if non-empty, accumulates one bit-per-`u8` record per ficBlock
+/// (`FIC_OUT_BITS = 768` entries each). Used by the bit-by-bit diff lane
+/// (`dab diag-viterbi-bits`) to localise where the dab-rs chain diverges
+/// from a live ETI's FIB bytes — separately checking the Viterbi output
+/// before energy descramble (gotcha #7 prime suspect), after descramble
+/// (PRBS polarity / seed), and the final packed bytes (bit-ordering).
+#[derive(Debug, Default)]
+pub struct DecodeDumps {
+    /// Pre-descramble Viterbi output, bit-per-byte (`0` / `1`). Length
+    /// after a full frame: 4 * 768 = 3072 entries.
+    pub viterbi_out: Vec<u8>,
+    /// Post-descramble bits, bit-per-byte. Same length as `viterbi_out`.
+    pub descrambled: Vec<u8>,
+}
+
+/// Same as [`decode_fic_soft_bits_to_bytes`] but also fills the provided
+/// [`DecodeDumps`] with per-ficBlock intermediate bit streams.
+pub fn decode_fic_soft_bits_with_dumps(
+    frame_soft: &[i16],
+    dumps: &mut DecodeDumps,
+) -> Vec<u8> {
     assert_eq!(
         frame_soft.len(),
         FIC_SOFT_BITS_PER_FRAME,
@@ -299,10 +365,26 @@ pub fn decode_fic_soft_bits_to_bytes(frame_soft: &[i16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(FIC_BYTES_PER_FRAME);
     let mut fic = FicProtection::new();
     for chunk in frame_soft.chunks_exact(FIC_IN_BITS) {
+        // Stage A: depuncture + Viterbi decode → 768 info bits, bit-per-byte.
         let info_bits = fic.deconvolve(chunk);
-        // descramble_and_pack: XOR with FIC PRBS (init all-ones, x^9 + x^5 + 1)
-        // and pack MSB-first into bytes. Identical PRBS to the FIC handler in
-        // eti-stuff (it generates the same 768-bit PRBS in its constructor).
+        debug_assert_eq!(info_bits.len(), FIC_OUT_BITS);
+        dumps.viterbi_out.extend_from_slice(&info_bits);
+
+        // Stage B: energy descramble (XOR with FIC PRBS).
+        //
+        // `descramble_and_pack` re-applies the PRBS internally and packs
+        // MSB-first. To dump the bit-level descrambled stream separately
+        // we recompute it here in bit form. The packed `bytes` below uses
+        // the same XOR so the two are guaranteed consistent.
+        let prbs = dab_descramble::prbs_sequence(info_bits.len());
+        let descrambled_bits: Vec<u8> = info_bits
+            .iter()
+            .zip(prbs.iter())
+            .map(|(b, p)| b ^ p)
+            .collect();
+        dumps.descrambled.extend_from_slice(&descrambled_bits);
+
+        // Stage C: pack MSB-first into 96 bytes (= 3 FIBs).
         let bytes = descramble_and_pack(&info_bits);
         debug_assert_eq!(bytes.len(), FIC_OUT_BITS / 8);
         out.extend_from_slice(&bytes);
