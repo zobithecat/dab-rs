@@ -48,6 +48,51 @@ enum Command {
         #[arg(long, default_value_t = 3_000_000)]
         rate: u32,
     },
+    /// Resample a `Cs16Le @ 3 MSPS` capture and quantize it to `CU8 @ 2.048
+    /// MSPS` — the format eti-stuff's `eti-cmdline-rawfiles` expects.
+    /// Lets the oracle binary process the same captures dab-rs handles
+    /// natively, so the two pipelines can be cross-checked on identical
+    /// resampled samples (the CU8 quantization adds ~−48 dB noise, which
+    /// is well below any real chain-bug-sized divergence).
+    ConvertIq {
+        /// Input `Cs16Le @ 3 MSPS` capture.
+        input: PathBuf,
+        /// Output `CU8 @ 2.048 MSPS` file.
+        output: PathBuf,
+    },
+    /// Cross-validate dab-rs's per-symbol soft bits against an oracle dump
+    /// produced by the patched `eti-cmdline-rawfiles` (env var
+    /// `DAB_RS_DIAG_DUMP` set to a writable path).
+    DiagIbits {
+        /// Path to the I/Q capture (Cs16Le @ 3 MSPS by default; CU8 @
+        /// 2.048 MSPS with `--ingest cu8` — use the same CU8 file the
+        /// oracle consumed to make the inputs bit-identical).
+        iq: PathBuf,
+        /// Path to the oracle's binary dump.
+        oracle: PathBuf,
+        /// Maximum number of frames to capture on the dab-rs side.
+        #[arg(long, default_value_t = 30)]
+        frames: usize,
+        /// `cs16le` (native, resampled) or `cu8` (read the same CU8 file
+        /// the oracle saw — eliminates quantisation as a variable).
+        #[arg(long, default_value = "cs16le")]
+        ingest: String,
+    },
+    /// Dump one (frame, symbol) record side-by-side from dab-rs and the
+    /// oracle, with permutation/sign-flip/bin-shift diagnostics. Useful
+    /// for inspecting why `diag-ibits` reports a low match rate.
+    DiagPair {
+        iq: PathBuf,
+        oracle: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        frame: u32,
+        #[arg(long, default_value_t = 5)]
+        symbol: u32,
+        #[arg(long, default_value_t = 12)]
+        show: usize,
+        #[arg(long, default_value = "cu8")]
+        ingest: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -57,7 +102,53 @@ fn main() -> Result<()> {
         Command::Fec { eti, subch } => run_fec(&eti, subch),
         Command::Fic { eti } => run_fic(&eti),
         Command::FicIq { iq, format, rate } => run_fic_iq(&iq, &format, rate),
+        Command::ConvertIq { input, output } => run_convert_iq(&input, &output),
+        Command::DiagIbits { iq, oracle, frames, ingest } => {
+            run_diag_ibits(&iq, &oracle, frames, &ingest)
+        }
+        Command::DiagPair { iq, oracle, frame, symbol, show, ingest } => {
+            let m = parse_ingest(&ingest)?;
+            dab_cli::diag_ibits::dump_pair(&iq, m, &oracle, frame, symbol, show)
+        }
     }
+}
+
+fn parse_ingest(s: &str) -> Result<dab_cli::diag_ibits::IqIngest> {
+    Ok(match s.to_lowercase().as_str() {
+        "cs16le" => dab_cli::diag_ibits::IqIngest::Cs16Le3MSPS,
+        "cu8" => dab_cli::diag_ibits::IqIngest::Cu82048k,
+        other => anyhow::bail!("unsupported --ingest {other} (use cs16le or cu8)"),
+    })
+}
+
+fn run_diag_ibits(
+    iq: &std::path::Path,
+    oracle: &std::path::Path,
+    frames: usize,
+    ingest: &str,
+) -> Result<()> {
+    let ingest_mode = match ingest.to_lowercase().as_str() {
+        "cs16le" => dab_cli::diag_ibits::IqIngest::Cs16Le3MSPS,
+        "cu8" => dab_cli::diag_ibits::IqIngest::Cu82048k,
+        other => anyhow::bail!("unsupported --ingest {other} (use cs16le or cu8)"),
+    };
+    let res = dab_cli::diag_ibits::run_diag(iq, ingest_mode, oracle, frames)?;
+    dab_cli::diag_ibits::print_report(&res);
+    Ok(())
+}
+
+fn run_convert_iq(input: &std::path::Path, output: &std::path::Path) -> Result<()> {
+    let pairs = dab_cli::convert_iq::convert_cs16_3m_to_cu8_2048k(input, output)?;
+    let bytes = pairs * 2;
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    println!(
+        "wrote {} CU8 sample pairs ({} bytes ≈ {:.1} MiB) to {}",
+        pairs,
+        bytes,
+        mb,
+        output.display(),
+    );
+    Ok(())
 }
 
 fn run_fic_iq(iq: &std::path::Path, format: &str, rate: u32) -> Result<()> {

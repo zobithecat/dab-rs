@@ -194,11 +194,26 @@ contributor (or the next paper reviewer) deserves to know up front.
   explicitly notes "in the reversed form the polys look { 0133, 0171,
   0145, 0133 }". The current `dab-viterbi` is a port of the scalar
   `viterbiHandler` and emits 0/2496 valid FIBs on the `k8b_v4.iq` oracle
-  even when the upstream OFDM soft bits are healthy
-  (`crates/dab-cli/tests/k8b_v4_fic_iq.rs`). Resolution requires either a
-  faithful port of `viterbiSpiral` or instrumenting eti-stuff with
-  `HAVE_DUMPING` to cross-check Viterbi input bits and confirm the encoder
-  convention.
+  even when the upstream OFDM soft bits look statistically healthy
+  (`crates/dab-cli/tests/k8b_v4_fic_iq.rs`).
+
+  **2026-05-28 update — divergence is *upstream* of Viterbi.** The
+  `docs/diag/` cross-validation infrastructure (env-gated `ibits` dump in
+  patched eti-stuff + `dab diag-ibits` / `dab diag-pair`) shows that
+  *given the identical CU8 input*, `dab-rs`'s `Stage 7 demap` output
+  already disagrees with the oracle's `processBlock` output at the
+  random-baseline match rate of 0.42 %. The multisets of values are
+  different (not a permutation, sign flip, I/Q swap, or small bin
+  shift), yet both pipelines produce identical `mean|b|` = 63/127
+  distributions. That signature — identical statistics, uncorrelated
+  values — is what a persistent fractional-CFO residual or sub-sample
+  PRS timing offset produces: every consecutive-symbol differential is
+  rotated by a fixed angle, which scrambles soft bits while preserving
+  per-symbol statistics. Next step is dumping the oracle's per-frame
+  `fineCorrector`/`coarseCorrector` and PRS sample index, and the FFT
+  output before the differential, to localise which exact stage
+  diverges. The viterbi convention question above remains an open gap
+  but is no longer the prime suspect.
 
 - **Airspy AGC (`-G 0`) is sub-optimal for marginal indoor SNR**
   *(planned, `dab-iq-airspy`).* On the same indoor K8B antenna setup, a

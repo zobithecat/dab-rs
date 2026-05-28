@@ -1,0 +1,39 @@
+diff --git a/eti-cmdline/src/ofdm/ofdm-processor.cpp b/eti-cmdline/src/ofdm/ofdm-processor.cpp
+index 86655ae..72e4f5b 100755
+--- a/eti-cmdline/src/ofdm/ofdm-processor.cpp
++++ b/eti-cmdline/src/ofdm/ofdm-processor.cpp
+@@ -407,6 +407,34 @@ SyncOnPhase:
+ 	      for (i = (int)T_u; i < (int)T_s; i ++) 
+ 	         FreqCorr += ofdmBuffer [i] * conj (ofdmBuffer [i - T_u]);
+ 	      processBlock (ofdmBuffer, ibits);
++
++	      // ---- dab-rs diagnostic dump (opt-in via env var DAB_RS_DIAG_DUMP) ----
++	      // Each record: u32 frame_idx, u32 ofdmSymbolCount, i16 ibits[2*carriers]
++	      // frame_idx increments each time ofdmSymbolCount wraps back to 2.
++	      {
++	         static FILE *   _diag_fp        = nullptr;
++	         static int      _diag_init      = 0;
++	         static uint32_t _diag_frame_idx = 0;
++	         if (!_diag_init) {
++	            const char *p = getenv ("DAB_RS_DIAG_DUMP");
++	            if (p != nullptr && *p != '\0') {
++	               _diag_fp = fopen (p, "wb");
++	               if (_diag_fp == nullptr)
++	                  fprintf (stderr, "dab-rs diag: fopen('%s') failed\n", p);
++	               else
++	                  fprintf (stderr, "dab-rs diag: writing per-symbol ibits to %s\n", p);
++	            }
++	            _diag_init = 1;
++	         }
++	         if (_diag_fp != nullptr) {
++	            if (ofdmSymbolCount == 2)
++	               _diag_frame_idx++;
++	            uint32_t hdr [2] = { _diag_frame_idx, (uint32_t) ofdmSymbolCount };
++	            fwrite (hdr,   sizeof (uint32_t), 2,             _diag_fp);
++	            fwrite (ibits, sizeof (int16_t),  2 * carriers,  _diag_fp);
++	         }
++	      }
++
+ 	      my_etiGenerator -> processBlock (ibits, ofdmSymbolCount);
+ 	   }
+ 
