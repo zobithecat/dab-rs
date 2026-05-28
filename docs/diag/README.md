@@ -560,42 +560,132 @@ The most economical hypothesis that explains all three is still
 the real DAB transmitter). But this slice does *not* uniquely
 confirm it.
 
-## Slice-8 fork
+## Eighth-iteration findings (2026-05-29, synthetic Viterbi unit test)
 
-Bug still localised to `dab-viterbi` *or* the OFDM-to-Viterbi
-handoff. To distinguish without relying on the broken offline oracle:
+Slice 8 ran slice-7's recommended **fork 2** ("Direct dab-rs ↔
+eti-stuff Viterbi unit test"): build two standalone CLI harnesses —
+oracle-side `docs/diag/viterbi_spiral_cli.cpp` (links eti-stuff's
+`viterbiSpiral`, `protTables` and `spiral-no-sse`) and dab-rs-side
+`dab viterbi-cli` (calls `FicProtection::deconvolve`) — that share
+the same stdin / stdout protocol (2304 signed bytes in, 768 hard
+bits out). Pipe five deterministic test vectors to both and bit-XOR.
+This isolates the Viterbi conventions completely from any OFDM /
+sync / oracle-stability noise.
 
-1. **Get a higher-SNR capture where the offline oracle locks.** The
-   slice-7 cross-check failed to be unambiguous purely because the
-   oracle's coarseCorrector blows up on `k8b_v4`. A capture clean
-   enough that `eti-cmdline-wavfiles` produces a non-zero ETI matching
-   the live oracle would give a stable Viterbi input/output reference
-   and *would* discriminate Result A from Result B. Candidates: a new
-   shorter capture at a known-good site, or `k8b_strong.iq` /
-   `k8b_v3.iq` if those have been recorded at a stronger gain or
-   antenna setup. This is the cheapest path back to a clean
-   comparator.
-2. **Direct dab-rs ↔ eti-stuff Viterbi unit-test.** Pick one ficBlock
-   of soft bits (any non-degenerate input) and call *both*
-   `viterbiSpiral::deconvolve` and `dab-viterbi`'s scalar Viterbi on
-   the *same* synthetic input. If they output identical 768 hard bits,
-   dab-viterbi is byte-equivalent to viterbiSpiral and the fork-1 port
-   would not change behaviour — the bug is elsewhere. If they differ,
-   the scalar Viterbi convention is wrong and fork 1 is justified
-   *with proof*. Easier than a full port and answers the open
-   question.
-3. **Audit OFDM-side bit ordering against EN 300 401 §14.6.** dab-rs's
-   `dqpsk_demap` writes 1536 I bits followed by 1536 Q bits per OFDM
-   symbol; the FIC handler then ingests three consecutive symbols
-   (9216 bits) and splits into 4 ficBlocks of 2304 each. Confirm
-   ETSI orders the same way (I-block-then-Q-block, frequency-
-   de-interleaved, not Q-first or carrier-interleaved). A single
-   permutation mistake here would explain Result B without any
-   Viterbi bug.
-4. **Run the airspy hardware sanity script** (`docs/diag/airspy-sanity.sh`)
-   in parallel — orthogonal to the Viterbi question but still answers
-   the slice-4 fork about whether libairspy's two output paths are
-   byte-equivalent.
+Test vectors and harness outputs (`docs/diag/viterbi_unit_diff.py`):
+
+| Vector         | Input                                          | Match    | Pattern                       |
+| -------------- | ---------------------------------------------- | --------:| ----------------------------- |
+| zeros          | 2304 × `0x00` (no info)                        | 0.0013   | block-boundary structure      |
+| plus127        | 2304 × `+127`                                  | 0.9401   | tail-bit-driven divergence    |
+| minus127       | 2304 × `-127`                                  | **1.0000** | bit-identical                |
+| alternating    | 2304 × `±127`                                  | 0.4323   | no obvious pattern            |
+| **encoded_rng**| **DAB mother-encode + FIC depuncture + ±127** | **1.0000** | **bit-identical**           |
+
+And the encoded-vector round-trip:
+
+```
+spiral output vs original 768-bit message  : 768/768 = 1.0000
+dab-rs output vs original 768-bit message  : 768/768 = 1.0000
+```
+
+### Interpretation
+
+The two decoders are **byte-identical on a real DAB-encoded signal**
+*and* both perfectly recover the original 768-bit info word. The
+zero / `±127` / alternating discrepancies are tiebreaker artefacts
+on inputs that carry no real information: with every soft sample at
+the same magnitude, multiple state paths have identical metric and
+the implementations make different arbitrary choices. That is
+*expected* and does not indicate a bug.
+
+The round-trip success on `encoded_rng` is the unambiguous evidence:
+the encoder in `docs/diag/viterbi_unit_diff.py` uses dab-viterbi's
+polynomials `{0o133, 0o171, 0o145, 0o133}` in MSB-newest register
+convention; both `viterbiSpiral` (bit-reversed polynomials internal,
+LSB-newest) and dab-viterbi (forward polys, MSB-newest) invert it
+correctly. **Both are valid decoders for the same DAB code, just
+with different internal representations**, exactly as the
+`viterbi-spiral.cpp` source comment hints. dab-viterbi's
+convention is **not** broken against the real DAB transmitter.
+
+### gotcha #7 is REFUTED
+
+Slice 3 raised gotcha #7 (`dab-viterbi` self-consistent only;
+suspected wrong against real DAB encoder). Slice 6 thought it had
+confirmed gotcha #7 from the bit-pattern signature of the live ETI
+diff. Slice 8 disproves it: dab-viterbi byte-for-byte matches
+viterbiSpiral on the synthetic encoder round-trip *and* both recover
+the encoder's input exactly. **The Viterbi is correct.**
+
+### Where the FIC-bit bug actually lives
+
+With the Viterbi cleared, the remaining suspects all sit *between*
+the OFDM demap and the Viterbi:
+
+1. **Soft-bit polarity on real signals.** Slice-8 vectors all used
+   `+127 ⇒ bit 1` / `-127 ⇒ bit 0`; the real OFDM demap uses
+   `-r.re / |r| * 127` (slice-3 README note). If that mapping
+   produces values in the *opposite* sign convention from what
+   FicProtection expects, the depuncture+Viterbi would see negated
+   soft bits at every transmitted position and decode a totally
+   different info word.
+2. **Frequency de-interleaver permutation.** The OFDM demap reads
+   the FFT bin order through `freq_interleaver::map_in`; if the
+   permutation is off by one carrier or maps to the wrong sign of
+   the carrier index, the soft bits arrive at the Viterbi in the
+   wrong positional order.
+3. **I/Q ordering in the demap loop.** dab-rs's `dqpsk_demap` emits
+   1536 I bits followed by 1536 Q bits per OFDM symbol; the FIC
+   pipeline ingests three consecutive symbols. If the encoder packs
+   `(I0, Q0, I1, Q1, …)` interleaved or splits at a different
+   symbol boundary, every ficBlock receives the wrong 2304-bit
+   slice.
+4. **Differential demap reference sign.** `r = current * conj(prev)`
+   vs `r = conj(current) * prev` would conjugate every soft bit's
+   imaginary part — same magnitude but inverted Q.
+
+## Slice-9 fork
+
+The remaining options are now:
+
+Bug is now provably **upstream of the Viterbi**, somewhere in the
+OFDM-to-FIC handoff (depuncture, ficBlock split, freq-de-interleave,
+soft-bit polarity, or differential demap reference sign). In rough
+order of cheapest to test:
+
+1. **Soft-bit polarity bisection.** Take a single ficBlock of
+   *actual* OFDM-demap output (3072 bits via slice-6 dumps), negate
+   every byte, feed into `dab viterbi-cli`, compare the resulting
+   FIB-CRC pass rate against the un-negated version. A 0 % → ~75 %
+   jump under sign flip would localise the bug to `dqpsk_demap`'s
+   leading minus.
+2. **Frequency de-interleaver permutation audit.** Write a unit
+   test that encodes a known 768-bit FIB → 3096-mother → puncture →
+   2304 transmitted; place those 2304 bits onto carriers via the
+   *inverse* of `FreqInterleaver`; emit them through a synthetic
+   π/4-DQPSK constellation; then run the whole `dab fic-iq`
+   pipeline from the synthetic OFDM symbol back to FIB. If the
+   round-trip fails at a specific carrier mapping, the
+   interleaver direction is inverted.
+3. **I-block vs Q-block ordering audit.** Same kind of synthetic
+   round-trip, but vary whether the synthetic FIB bits land at
+   I positions, Q positions, or interleaved. Whichever ordering
+   round-trips is the one the standard prescribes.
+4. **Differential demap conjugation audit.** Build a synthetic
+   stream of two adjacent OFDM symbols where the second carries a
+   known phase increment Δ; check that `DifferentialReference::step`
+   computes `r = current * conj(prev)` and `arg(r) = Δ` (not `-Δ`).
+   This is the cheapest test of all and would catch a flipped-conj
+   bug instantly.
+
+Each of these can be a separate slice. The synthetic round-trip
+machinery from slice 8 (`docs/diag/viterbi_unit_diff.py::
+make_encoded_vector`) is the building block.
+
+Orthogonal (still queued from earlier slices):
+- `docs/diag/airspy-sanity.sh` — hardware libairspy byte-equivalence
+  check.
 
 ## Closing the patch
 

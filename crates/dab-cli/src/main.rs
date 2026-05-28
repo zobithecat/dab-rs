@@ -105,6 +105,15 @@ enum Command {
         #[arg(long, default_value = "cu8")]
         ingest: String,
     },
+    /// Slice-8 standalone Viterbi harness. Reads 2304 signed bytes
+    /// (one i8 soft bit each) from stdin, runs FIC depuncture +
+    /// scalar Viterbi via `dab_viterbi::FicProtection`, writes 768
+    /// hard bits (one bit per byte, value 0 or 1) to stdout.
+    ///
+    /// Same I/O protocol as `docs/diag/viterbi_spiral_cli.cpp` so a
+    /// synthetic test vector can be piped to both binaries and the
+    /// outputs bit-XOR'd by `docs/diag/viterbi_unit_diff.py`.
+    ViterbiCli,
 }
 
 fn main() -> Result<()> {
@@ -122,7 +131,27 @@ fn main() -> Result<()> {
             let m = parse_ingest(&ingest)?;
             dab_cli::diag_ibits::dump_pair(&iq, m, &oracle, frame, symbol, show)
         }
+        Command::ViterbiCli => run_viterbi_cli(),
     }
+}
+
+fn run_viterbi_cli() -> Result<()> {
+    use std::io::{Read, Write};
+    const FIC_IN: usize = 2304;
+    const FIC_OUT: usize = 768;
+    let mut buf = [0_u8; FIC_IN];
+    std::io::stdin()
+        .read_exact(&mut buf)
+        .map_err(|e| anyhow::anyhow!("stdin: expected {FIC_IN} bytes ({e})"))?;
+    // Reinterpret bytes as i8 soft bits, widen to i16 for the decoder.
+    let soft: Vec<i16> = buf.iter().map(|&b| (b as i8) as i16).collect();
+    let mut fic = dab_viterbi::FicProtection::new();
+    let bits = fic.deconvolve(&soft);
+    assert_eq!(bits.len(), FIC_OUT);
+    std::io::stdout()
+        .write_all(&bits)
+        .map_err(|e| anyhow::anyhow!("stdout: {e}"))?;
+    Ok(())
 }
 
 fn parse_ingest(s: &str) -> Result<dab_cli::diag_ibits::IqIngest> {
