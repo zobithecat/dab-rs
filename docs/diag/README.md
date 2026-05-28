@@ -311,7 +311,72 @@ What we know for certain after slice 4:
   pipelines independently making different CFO decisions on the same
   unstable input.
 
-## Slice-5 fork
+## Fifth-iteration findings (2026-05-28, functional validation + sanity script)
+
+Slice 5 ran the *PRIMARY* validation lane recommended at the end of
+slice 4: skip the offline oracle entirely and measure dab-rs's full
+chain against the live `k8b_v4.eti` ensemble model. The reference
+numbers come straight from `dab fic` on the live ETI:
+
+```
+fib_ok = 7517 / 10024  = 75.0 %
+EId    = 0xE040  (YTN DMB)
+sub-channels: 4 (sub 1 EEP-3A 352 kbps, sub 3 EEP-3A 152 kbps,
+                 sub 6 EEP-3B 480 kbps, sub 9 EEP-3B 384 kbps)
+services:     5 (mYTN, HD mYTN, 4DRIVE, LOTTE Homeshop, YTN EWS)
+```
+
+dab-rs's `dab fic-iq` on the same source (`k8b_v4.iq`, cs16le @ 3 MSPS):
+
+```
+resampled = 40 960 000   nulls = 208   frames_decoded = 208
+band_ratio = 10.9 dB     frames_skipped = 0
+
+fib_ok        = 0 / 2496
+EId           = (none)
+sub-channels  = 0
+services      = 0
+```
+
+### Functional verdict
+
+- **OFDM Stages 1–7 are functionally correct.** 208/208 OFDM frames
+  decoded with a 10.9 dB PRS active/guard band ratio and balanced
+  soft-bit statistics; this matches the dab-ofdm `k8b_v4_ofdm_chain`
+  integration test and is consistent with the per-symbol ibits we
+  dumped in slice 2.
+- **Everything downstream of the demap is broken.** 0 / 2496 FIBs
+  pass CRC on this capture; on the live reference 75 % do. The
+  100-percentage-point gap collapses to the dab-viterbi /
+  dab-descramble / dab-fic chain that ingests Stage 7's soft bits.
+  gotcha #7 in the project README (dab-viterbi self-consistent only)
+  is the prime suspect.
+
+### Secondary anomaly: FIBs per frame mismatch
+
+- Live ETI: 10 024 FIBs across 2 506 ETI(NI) frames → 4 FIBs per
+  ETI frame.
+- dab-rs: 2 496 FIBs across 208 OFDM frames → 12 FIBs per OFDM
+  frame (4 ficBlocks × 3 FIBs).
+
+3× discrepancy worth confirming: either the ETI(NI) container stores
+a *subset* of the 12 per-frame FIBs (likely 1 ficBlock's 96 bytes =
+3 FIBs per ETI frame and our dab-fic ETI reader is producing 4 from
+some 128-byte FIC region in the container), or dab-rs's `fic_iq`
+generates 3× too many FIBs per OFDM frame. Slice-6 follow-up.
+
+### Fork 1 sanity script (`docs/diag/airspy-sanity.sh`)
+
+A reproducible shell script the user can run with airspy hardware to
+test the *secondary* slice-5 question — does libairspy emit the same
+INT16_IQ bytes via the realtime callback as it does via `airspy_rx
+-t 2 -r file.iq`? The script captures two back-to-back airspy_rx
+file streams (verifies the file path is statistically stable),
+prints distribution stats, and documents the manual airspy-handler
+patch needed for the full file-vs-callback diff. Hardware-bound; can
+be run independently of dab-rs.
+
+## Slice-6 fork
 
 The remaining options are now:
 
