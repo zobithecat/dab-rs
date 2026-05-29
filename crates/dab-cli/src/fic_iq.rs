@@ -177,6 +177,14 @@ pub fn process_iq_to_fic(
     let mut demap_out_fp: Option<BufWriter<File>> = std::env::var("DAB_RS_DUMP_DEMAP_OUT")
         .ok()
         .and_then(|p| File::create(&p).ok().map(BufWriter::new));
+    // Slice-11 arg(r) heatmap: per-frame 3 differential spectra
+    // (post-rotation by integer-CFO δ, post-`DifferentialReference::step`).
+    // Header: u32 frame_idx, payload: 3 × 2048 complex<f32> LE pairs
+    // (49152 bytes). The arg of each active-carrier r value gives the
+    // π/4-DQPSK constellation phase + any residual upstream rotation.
+    let mut diff_spec_fp: Option<BufWriter<File>> = std::env::var("DAB_RS_DUMP_DIFF_SPEC")
+        .ok()
+        .and_then(|p| File::create(&p).ok().map(BufWriter::new));
 
     let p = |z: &Complex<f32>| (z.re as f64).powi(2) + (z.im as f64).powi(2);
 
@@ -213,7 +221,18 @@ pub fn process_iq_to_fic(
         }
 
         // ---- Stage 4/5: FFT the PRS, with fractional-CFO removal ----
-        let prs_spec_raw = fft_symbol_corrected(&resampled, prs_start, cfo_hz, &mut sfft);
+        //
+        // A single `Nco` is created per frame and shared across the PRS and
+        // every subsequent data-symbol call, so the per-symbol phase carry
+        // of the residual CFO is preserved across symbol boundaries.
+        // Without this, the `Nco` reset every `fft_symbol_corrected` call
+        // injects a constant `exp(-j*2π*cfo*TS/fs)` rotation into every
+        // consecutive-symbol differential — about ±90° at the −200 Hz CFO
+        // we measure on K8B — which deterministically permutes every
+        // π/4-DQPSK bit pair and feeds the Viterbi a wrong-trellis stream.
+        let mut frame_nco = Nco::new(FS_INTERNAL);
+        let prs_spec_raw =
+            fft_symbol_corrected(&resampled, prs_start, cfo_hz, &mut sfft, &mut frame_nco);
 
         // ---- Stage 4b: integer CFO detection on the PRS spectrum ----
         //
@@ -251,12 +270,17 @@ pub fn process_iq_to_fic(
 
         // ---- Demap the 3 FIC OFDM symbols ----
         let mut frame_soft: Vec<i16> = Vec::with_capacity(FIC_SOFT_BITS_PER_FRAME);
+        let mut diff_specs_for_dump: Vec<Vec<Complex<f32>>> = Vec::with_capacity(FIC_SYMBOLS);
         let mut ok = true;
         for s in 1..=FIC_SYMBOLS {
             let cp_start = prs_start + s * TS;
-            let spec_raw = fft_symbol_corrected(&resampled, cp_start, cfo_hz, &mut sfft);
+            let spec_raw =
+                fft_symbol_corrected(&resampled, cp_start, cfo_hz, &mut sfft, &mut frame_nco);
             let spec = rotate_spectrum(&spec_raw, delta);
             let diff = diff_ref.step(&spec);
+            if diff_spec_fp.is_some() {
+                diff_specs_for_dump.push(diff.clone());
+            }
             let bits = demap.demap(&diff);
             if bits.len() != BITS_PER_SYMBOL {
                 ok = false;
@@ -308,6 +332,19 @@ pub fn process_iq_to_fic(
             }
             let _ = fp.write_all(&buf);
         }
+        if let Some(fp) = diff_spec_fp.as_mut() {
+            if diff_specs_for_dump.len() == FIC_SYMBOLS {
+                let _ = fp.write_all(&dab_frame_idx.to_le_bytes());
+                let mut buf = Vec::with_capacity(FIC_SYMBOLS * 2048 * 8);
+                for spec in &diff_specs_for_dump {
+                    for z in spec {
+                        buf.extend_from_slice(&z.re.to_le_bytes());
+                        buf.extend_from_slice(&z.im.to_le_bytes());
+                    }
+                }
+                let _ = fp.write_all(&buf);
+            }
+        }
 
         // ---- Feed to the accumulator ----
         let prior_total = acc.fib_total;
@@ -330,6 +367,9 @@ pub fn process_iq_to_fic(
     if let Some(mut fp) = demap_out_fp {
         let _ = fp.flush();
     }
+    if let Some(mut fp) = diff_spec_fp {
+        let _ = fp.flush();
+    }
 
     result.ensemble = acc.ensemble;
     Ok(result)
@@ -343,9 +383,10 @@ fn fft_symbol_corrected(
     cp_start: usize,
     cfo_hz: f64,
     sfft: &mut SymbolFft,
+    nco: &mut Nco,
 ) -> Vec<Complex<f32>> {
     let mut region = resampled[cp_start..cp_start + TS].to_vec();
-    Nco::new(FS_INTERNAL).mix(&mut region, -cfo_hz);
+    nco.mix(&mut region, -cfo_hz);
     sfft.fft_symbol(&region)
 }
 

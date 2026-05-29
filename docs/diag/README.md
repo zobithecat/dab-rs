@@ -818,12 +818,119 @@ differential spectra in the first place — i.e. OFDM stages 1–6 in
 
 Each is a separate cheap test. Slice 11 should bisect.
 
-## Slice-11 fork
+## Eleventh-iteration findings (2026-05-29, NCO carry + arg(r) heatmap ↦ Pattern D)
 
-Slice 10 cleared every downstream-of-OFDM hypothesis. The bug lives
-in dab-ofdm stages 1–6 (the per-frame loop that *produces* the
-differential spectra), not in `dqpsk_demap` or the FIC chain. Four
-cheap bisections, in priority order:
+Slice 11 ran the cheapest fix-and-measure path from slice-10 fork 2
+(NCO phase carry across PRS + FIC data symbols within a frame) plus
+the arg(r) diagnostic heatmap from slice-10 fork 1.
+
+NCO carry fix
+- `crates/dab-cli/src/fic_iq.rs::fft_symbol_corrected` now takes a
+  `&mut Nco` and the per-frame loop in `process_iq_to_fic` builds
+  one `Nco::new(FS_INTERNAL)` instance up front and threads it
+  through the PRS call and every subsequent data-symbol call. Phase
+  carries naturally across symbol boundaries.
+- Theoretical impact: removes a constant
+  `exp(-j·2π·cfo·TS/fs)` rotation per consecutive-symbol
+  differential. At the −350 Hz CFO measured on K8B that is about
+  ±158° per symbol — large enough to cyclically permute every
+  π/4-DQPSK bit pair if the differential demap saw it raw.
+- Measured impact on `dab fic-iq k8b_v4.iq`: 0 / 2496 → **0 / 2496**.
+  The fix is theoretically correct (phase *should* carry across
+  symbols within a frame) but does not by itself unblock the chain.
+
+arg(r) heatmap diagnostic
+- New `DAB_RS_DUMP_DIFF_SPEC` env-gated dump in `fic_iq.rs`: per
+  frame, `u32 frame_idx + 3 × 2048 Complex<f32>` (49 152 bytes).
+- New `docs/diag/arg_r_heatmap.py` reads the dump, walks the 1536
+  active carriers per symbol, folds each `arg(r)` onto the nearest
+  π/4-DQPSK target (`π/4, 3π/4, -3π/4, -π/4`), and reports
+  per-symbol residual mean, residual stddev, and a per-carrier
+  linear-regression slope of residual.
+
+Result on `k8b_v4.iq` (frames 1–3):
+
+| sym | mean \|arg(r)\| | mean residual | stddev | slope (rad/carrier) |
+| ---:| ---------------:| -------------:| ------:| -------------------:|
+| 1   | 1.5805 – 1.6049 |       ±0.02   | 0.44   | ≤ 1.7 × 10⁻⁵        |
+| 2   | 1.5618 – 1.5833 |       ±0.02   | 0.43   | ≤ 7.1 × 10⁻⁶        |
+| 3   | 1.5587 – 1.5602 |       ±0.02   | 0.44   | ≤ 1.9 × 10⁻⁵        |
+
+`mean |arg(r)| ≈ π/2 = 1.5708` is *exactly* the expected value for
+an even mix over the four target angles ±π/4, ±3π/4. The per-symbol
+residual mean sits at ±0.02 rad (~ 1°). The slope is ~ 10⁻⁵
+rad/carrier — six orders of magnitude below what a sub-sample
+timing offset would produce. The 25° (0.44 rad) residual stddev is
+thermal-noise consistent for a 12 dB SNR signal *after* folding to
+the nearest target.
+
+This is **Pattern D — non-structural**. All four upstream
+hypotheses on the slice-10 fork list are now refuted:
+
+- Pattern A (linear-in-carrier slope) → slope ≤ 10⁻⁵: refuted.
+- Pattern B (uniform per-symbol offset) → mean residual ≤ 0.02 rad:
+  refuted.
+- Pattern C (per-symbol drift) → spread of per-symbol means ≤ 0.03
+  rad: refuted.
+- Pattern D (FFT bin order / sign / scale) → not actually
+  *observed* — the chain's arg(r) statistics are structurally
+  correct: the per-bin differentials cluster cleanly onto the four
+  π/4-DQPSK targets with only thermal noise spread.
+
+So the OFDM stages 1–6 produce *structurally healthy* differential
+spectra, just like the OFDM-side slice-5 black-box test always
+suggested. And yet the FIB CRC still fails.
+
+That leaves a different category of bug entirely — one we did not
+enumerate in the slice-10 fork list:
+
+1. **DAB constellation bit-mapping convention** between `(a, b)` and
+   the four target angles. dab-rs's `dqpsk_demap` reads
+   `bit_i = -r.re / |r| * 127` and `bit_q = -r.im / |r| * 127`,
+   which maps:
+   `π/4 → (0,0)`, `3π/4 → (1,0)`, `-3π/4 → (1,1)`, `-π/4 → (0,1)`.
+   The standard Gray-coded QPSK mapping is
+   `(0,0) → π/4`, `(0,1) → 3π/4`, `(1,1) → -3π/4`, `(1,0) → -π/4`.
+   These differ at the off-diagonal angles 3π/4 and −π/4 — `a` and
+   `b` are swapped. Slice 10's synth round-trip was self-consistent
+   with dab-rs's *own* convention so it did not catch this.
+2. **Soft-bit polarity convention** — although slice 8 cleared the
+   leading-minus convention against viterbiSpiral, the *real* DAB
+   transmitter might use a Gray-mapping convention where polarity
+   is computed differently. EN 300 401 §14.5 is the authority.
+3. **`a` vs `b` ordering across the 2 K-bit-per-symbol layout**.
+   dab-rs emits `1536 a-bits then 1536 b-bits`. The standard might
+   reverse the roles of a and b.
+
+## Slice-12 fork
+
+The arg(r) heatmap proved the differential spectra are
+structurally correct. The next slice has to look at how the *bit
+labels* `(a, b)` are assigned given an angle:
+
+1. **Read EN 300 401 §14.5 (or equivalent normative text) on
+   π/4-DQPSK bit-to-symbol mapping.** Identify whether the standard
+   uses
+   `(a, b) ∈ {00, 01, 11, 10} ↔ angles {π/4, 3π/4, -3π/4, -π/4}`
+   (Gray) or
+   `(a, b) ∈ {00, 10, 11, 01} ↔ angles {π/4, 3π/4, -3π/4, -π/4}`
+   (dab-rs current).
+2. **Brute-force the 8 single-axis flips.** With slice-10's
+   synth-test machinery, generate two ficBlocks of real-encoded
+   bits, and patch `dqpsk_demap` to emit *each* of the 8 possible
+   sign-flip combinations
+   `(sign_i, sign_q, swap_a_b) ∈ {±, ±, swap}`. Re-run
+   `dab fic-iq` for each patched build; the one that produces a
+   non-zero FIB CRC wins.
+3. **arg(r) histogram per FIB region.** Within one frame, plot a
+   2 D histogram of `arg(r)` for active carriers, separately for
+   each of the 4 quadrants the demap expects. If any quadrant's
+   distribution is rotated by 90° or has the wrong centre, the
+   bit-mapping interpretation is the bug.
+
+The cheapest is #2 — it is a one-line code change × 8 builds.
+
+## Earlier slice-11 fork (refuted — kept for reference)
 
 1. **Per-symbol differential `arg(r)` consistency check.** Feed two
    adjacent synthetic OFDM data symbols with a known phase increment
