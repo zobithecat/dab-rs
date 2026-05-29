@@ -52,8 +52,8 @@ use dab_descramble::descramble_and_pack;
 use dab_fic::FicAccumulator;
 use dab_iq::{IqFileReader, IqFormat};
 use dab_ofdm::{
-    detect_integer_cfo, CpSync, DifferentialReference, DqpskDemap, Nco, NullDetector, Resampler,
-    SymbolFft,
+    estimate_offset_eti, CpSync, DifferentialReference, DqpskDemap, LinearResampler, Nco,
+    NullDetector, SymbolFft,
 };
 use dab_viterbi::{FicProtection, FIC_IN_BITS, FIC_OUT_BITS};
 
@@ -73,7 +73,7 @@ const FIC_BLOCKS_PER_FRAME: usize = FIC_SOFT_BITS_PER_FRAME / FIC_IN_BITS; // 4
 /// Decoded FIC bytes per frame: 4 blocks × 96 bytes = 384 bytes = 12 FIBs.
 const FIC_BYTES_PER_FRAME: usize = FIC_BLOCKS_PER_FRAME * (FIC_OUT_BITS / 8); // 384
 /// Internal sample rate after Stage 1 resample.
-const FS_INTERNAL: f64 = 2_048_000.0;
+pub const FS_INTERNAL: f64 = 2_048_000.0;
 
 /// Aggregate result of running the I/Q → FIC pipeline on a capture.
 #[derive(Debug, Default)]
@@ -118,8 +118,20 @@ pub fn process_iq_to_fic(
     input_sample_rate_hz: u32,
 ) -> Result<FicIqResult> {
     // ---- Stage 1: read + resample to 2.048 MSPS ----
+    //
+    // Slice-17 bypass: if the input is already at the internal rate
+    // (`Cf32Le @ 2.048 MSPS`), skip the polyphase resampler so dab-rs
+    // consumes the EXACT post-resample stream eti-stuff produced via its
+    // own linear-interpolation rate converter. This isolates the sync /
+    // FFT-framing / differential stages from the resampler step.
+    let bypass_resampler =
+        input_format == IqFormat::Cf32Le && input_sample_rate_hz == 2_048_000;
     let mut reader = IqFileReader::open(iq_path, input_format, input_sample_rate_hz)?;
-    let mut resampler = Resampler::new_3m_to_2048k();
+    // SLICE-22: use eti-stuff's linear-interpolation resampler (airspy-handler.cpp:157-162)
+    // instead of the polyphase FIR. Slice-17 measured the FIR losing ~2.5 dB
+    // SNR vs linear-interp on K8B (marginal SNR ~11 dB), pushing the chain
+    // below decoding threshold for the cs16le-with-native-resampler path.
+    let mut resampler = LinearResampler::new(input_sample_rate_hz);
     let mut resampled: Vec<Complex<f32>> = Vec::with_capacity(41_000_000);
     let mut buf = vec![Complex::new(0.0_f32, 0.0); 1 << 20];
     loop {
@@ -127,7 +139,11 @@ pub fn process_iq_to_fic(
         if n == 0 {
             break;
         }
-        resampled.extend_from_slice(&resampler.process(&buf[..n]));
+        if bypass_resampler {
+            resampled.extend_from_slice(&buf[..n]);
+        } else {
+            resampled.extend_from_slice(&resampler.process(&buf[..n]));
+        }
     }
     if resampled.len() < 2_000_000 {
         return Err(anyhow!(
@@ -156,6 +172,26 @@ pub fn process_iq_to_fic(
     // ---- env-gated diagnostic dumps (see docstring) ----
     use std::fs::File;
     use std::io::{BufWriter, Write};
+    // SLICE-19 absolute-sample sync position dump. Same coordinate as
+    // eti-stuff's DAB_RS_DUMP_SYNC_POS (counted from getSamples consumption
+    // of the resampled stream). Record layout:
+    //     u32 LE frame_idx (1-based)
+    //     u32 LE ofdmSymbolCount (1 for PRS, 2..76 for data)
+    //     u64 LE abs_useful_start (sample index in the resampled stream
+    //                              where the FFT useful-part starts)
+    let mut sync_pos_fp: Option<BufWriter<File>> = std::env::var("DAB_RS_DUMP_SYNC_POS")
+        .ok()
+        .and_then(|p| File::create(&p).ok().map(BufWriter::new));
+
+    // SLICE-20 FFT input dump. Per FIC symbol writes:
+    //     u32 frame_idx, u32 sym, u64 useful_start,
+    //     2048 × complex<f32> pre-NCO useful samples,
+    //     2048 × complex<f32> post-NCO useful samples.
+    // Same useful_start coordinate as SYNC_POS so the PRE-mix samples
+    // can be byte-compared to cf32 file[useful_start..useful_start+T_u].
+    let mut fft_input_fp: Option<BufWriter<File>> = std::env::var("DAB_RS_DUMP_FFT_INPUT")
+        .ok()
+        .and_then(|p| File::create(&p).ok().map(BufWriter::new));
     let mut viterbi_fp: Option<BufWriter<File>> = std::env::var("DAB_RS_DUMP_VITERBI_OUT")
         .ok()
         .and_then(|p| File::create(&p).ok().map(BufWriter::new));
@@ -186,7 +222,32 @@ pub fn process_iq_to_fic(
         .ok()
         .and_then(|p| File::create(&p).ok().map(BufWriter::new));
 
+    // SLICE-16: pre-differential FFT bins, matching eti-stuff's `fft_buffer`
+    // dump (DAB_RS_DIAG_DUMP_FFT). Per-symbol record: u32 frame_idx, u32
+    // ofdmSymbolCount (eti-stuff convention: dab-rs FIC symbol s ↔ count s+1),
+    // then 2048 complex<f32> (re, im) LE bins in natural FFT order.
+    let mut fft_pre_fp: Option<BufWriter<File>> = std::env::var("DAB_RS_DUMP_FFT_PRE")
+        .ok()
+        .and_then(|p| File::create(&p).ok().map(BufWriter::new));
+
     let p = |z: &Complex<f32>| (z.re as f64).powi(2) + (z.im as f64).powi(2);
+
+    // SLICE-15 Pair 4: NCO continuous phase across frame boundaries.
+    // eti-stuff's `localPhase` is a class member that accumulates -phase per
+    // sample across the entire stream (ofdm-processor.cpp:168, 217). When
+    // re-instantiated per-frame, the start-of-frame phase resets to 0 and any
+    // residual CFO produces a discontinuity at every frame boundary that
+    // corrupts the next frame's PRS reference vs the eti-stuff convention.
+    let mut frame_nco = Nco::new(FS_INTERNAL);
+
+    // SLICE-15 Pair 3: cumulative fractional-CFO integrator. eti-stuff
+    // accumulates `fineCorrector += 0.1 * arg(FreqCorr) / M_PI *
+    // (carrierDiff/2)` per frame (ofdm-processor.cpp:526). The per-frame
+    // absolute estimate from CP autocorr equals (cumulative + residual)
+    // when samples are pre-corrected by cumulative, so an equivalent
+    // exponentially-weighted MA is `cumulative = 0.9 * cumulative + 0.1 *
+    // absolute`. Start at 0; converges over the first ~10 frames.
+    let mut cumulative_cfo_hz: f64 = 0.0;
 
     // ---- Per-frame loop ----
     for &null_pos in &nulls.positions {
@@ -205,52 +266,132 @@ pub fn process_iq_to_fic(
             continue;
         }
 
-        let prs_start = cp.fine_time(&resampled, prs_guess, TS);
+        // SLICE-19 narrow fine_time search: half = T_g/4 = 126 samples.
+        // The wide TS=2552 half makes CP autocorr peak-pick onto adjacent
+        // OFDM symbols' CP (autocorr peaks every T_s samples), and the
+        // SYNC_POS comparison showed dab-rs's prs_start oscillating by
+        // ±T_s = ±2552 between frames vs eti-stuff's stable lock. eti-stuff
+        // uses a frequency-domain PRS cross-correlation (findIndex) that is
+        // uniquely peaked on PRS only; until that's ported, bounding the
+        // CP-autocorr search to a quarter CP keeps us within the correct
+        // symbol's CP window.
+        let prs_start = cp.fine_time(&resampled, prs_guess, 126);
         if prs_start + (1 + FIC_SYMBOLS) * TS > resampled.len() {
             result.frames_skipped += 1;
             continue;
         }
+        // SLICE-19 sync-position dump. PRS useful_start = prs_start + T_g
+        // (start of the CP of the PRS symbol + T_g samples). Data symbol
+        // s=1..3 useful_start = prs_start + s*TS + T_g.
+        {
+            const T_G: usize = 504;
+            let frame_idx_now = (result.frames_decoded as u32) + 1;
+            if let Some(fp) = sync_pos_fp.as_mut() {
+                let _ = fp.write_all(&frame_idx_now.to_le_bytes());
+                let _ = fp.write_all(&1u32.to_le_bytes());
+                let prs_useful = (prs_start + T_G) as u64;
+                let _ = fp.write_all(&prs_useful.to_le_bytes());
+                for s in 1..=FIC_SYMBOLS {
+                    let _ = fp.write_all(&frame_idx_now.to_le_bytes());
+                    let sym = (s as u32) + 1;
+                    let _ = fp.write_all(&sym.to_le_bytes());
+                    let useful = (prs_start + s * TS + T_G) as u64;
+                    let _ = fp.write_all(&useful.to_le_bytes());
+                }
+            }
+        }
 
-        let cfo_hz = cp.estimate_cfo_hz(&resampled, prs_start, 50) as f64;
-        if !cfo_hz.is_finite() || cfo_hz.abs() > 600.0 {
+        // Absolute fractional CFO estimate from CP autocorrelation of raw
+        // samples. Used as the *input* to the integrator below; the NCO
+        // actually mixes with `cumulative_cfo_hz`.
+        let abs_cfo_hz = cp.estimate_cfo_hz(&resampled, prs_start, 50) as f64;
+        if !abs_cfo_hz.is_finite() || abs_cfo_hz.abs() > 600.0 {
             // Wider than the 500 Hz integration-test threshold to tolerate
             // occasional outliers; a frame with CFO > 600 Hz is almost
             // certainly a mis-locked sync attempt rather than real drift.
             result.frames_skipped += 1;
             continue;
         }
+        // SLICE-25 fudge-free CFO chain.
+        //
+        // Slice 21 used `abs_cfo_hz / 2` as an empirical fix that gave 89% FIB
+        // but had no mathematical justification. Slice 24 narrowed the 2× to a
+        // post-FFT step. Slice 25 found the actual mechanism:
+        //
+        //   eti-stuff applies the FULL CFO (integer carrier + fractional Hz)
+        //   in time-domain NCO via `getSamples(coarse + fine)`. The integer
+        //   part `coarseCorrector` contributes per-symbol NCO phase advance
+        //   `2π · δ · 1000 · T_s / fs = 2π · δ · T_s/T_u`, which the rotate-
+        //   based dab-rs approach (rotate_spectrum after FFT) DOES NOT apply.
+        //   Missing that ~7.83 rad / sym phase advance for δ=1 mis-aligns the
+        //   differential demap against the π/4-DQPSK constellation, hence the
+        //   4% pass at α=1.0.
+        //
+        //   Slice-21's /2 fudge compensated this by halving the NCO mix freq,
+        //   which happened to land the differential rotation near a workable
+        //   point on the constellation (still wrong by structure, but more
+        //   forgiving for the Viterbi soft-bit envelope). That's why α=0.5
+        //   + rotate worked at 89%.
+        //
+        //   The fix: include integer CFO in the time-domain NCO mix (matching
+        //   eti-stuff's `coarseCorrector + fineCorrector`), then skip
+        //   rotate_spectrum for data symbols. PRS keeps the rotate path
+        //   because we need PRS FFT first to detect δ. Within-frame phase
+        //   continuity then matches eti-stuff bit-for-bit and the full
+        //   fractional estimate (α=1.0) is used directly.
+        //
+        //   Validated: sim5 1704/1884 (90.4%), sim4 1637/1908 (85.8%) —
+        //   both at fudge-free α=1.0 + integer-in-NCO.
+        if result.frames_decoded == 0 {
+            cumulative_cfo_hz = abs_cfo_hz;
+        } else {
+            cumulative_cfo_hz = 0.9 * cumulative_cfo_hz + 0.1 * abs_cfo_hz;
+        }
+        let cfo_hz = cumulative_cfo_hz;
 
         // ---- Stage 4/5: FFT the PRS, with fractional-CFO removal ----
         //
-        // A single `Nco` is created per frame and shared across the PRS and
-        // every subsequent data-symbol call, so the per-symbol phase carry
-        // of the residual CFO is preserved across symbol boundaries.
-        // Without this, the `Nco` reset every `fft_symbol_corrected` call
-        // injects a constant `exp(-j*2π*cfo*TS/fs)` rotation into every
-        // consecutive-symbol differential — about ±90° at the −200 Hz CFO
-        // we measure on K8B — which deterministically permutes every
-        // π/4-DQPSK bit pair and feeds the Viterbi a wrong-trellis stream.
-        let mut frame_nco = Nco::new(FS_INTERNAL);
+        // The `Nco` is hoisted outside the per-frame loop (slice-15 Pair 4)
+        // so its phase accumulator is continuous across the entire stream,
+        // matching eti-stuff's class-member `localPhase` that runs over all
+        // samples without reset (ofdm-processor.cpp `getSample`/`getSamples`).
         let prs_spec_raw =
-            fft_symbol_corrected(&resampled, prs_start, cfo_hz, &mut sfft, &mut frame_nco);
+            fft_symbol_corrected_with_dump(
+                &resampled, prs_start, cfo_hz, &mut sfft, &mut frame_nco,
+                fft_input_fp.as_mut(),
+                (result.frames_decoded as u32) + 1,
+                1u32,
+            );
 
         // ---- Stage 4b: integer CFO detection on the PRS spectrum ----
         //
-        // `detect_integer_cfo` is sensitive to timing residuals on captured
-        // signals (coherent correlation breaks down under per-carrier phase
-        // ramps left by sub-sample timing offsets). Only apply the detected
-        // δ when the peak is *meaningfully* above the runner-up; otherwise
-        // default to δ = 0. eti-stuff's `estimateOffset` uses adjacent-
-        // carrier phase *differences* which would be timing-invariant — that
-        // is a planned follow-up; see notes in `dab-ofdm::integer_cfo`.
-        let icfo_raw = detect_integer_cfo(&prs_spec_raw, 5);
-        let delta = if icfo_raw.peak > 1.5 * icfo_raw.runner_up {
-            icfo_raw.offset
-        } else {
-            0
-        };
+        // Slice-13 Pair 2 fix: use the eti-stuff `estimateOffset` algorithm
+        // (adjacent-carrier phase differences) instead of the magnitude-
+        // correlation `detect_integer_cfo`. The phase-difference form is
+        // timing-invariant — sub-sample timing residuals introduce a
+        // per-carrier phase ramp that cancels in adjacent differences — so
+        // it recovers the correct δ even when `cp.fine_time` is one sample
+        // off the true symbol start. Search range is ±35 carriers (verbatim
+        // from `eti-stuff/src/ofdm/phasereference.cpp::estimateOffset`).
+        // SLICE-20 Result-shift fix: per_bin_phase.py measured |cc|=0.9986 at
+        // m=+1 between dab-rs and eti-stuff FFT bins on the same input window
+        // (sample-aligned via SYNC_POS). The dab-rs spectrum was right-shifted
+        // by 1 carrier vs eti-stuff because slice-15's `delta=0` forced this
+        // to drop integer-CFO correction. rotate_spectrum(spec, +1) does
+        // `out[i] = spec[i+1]` — a left shift — undoing the +1 spectral
+        // mismatch so de-interleaver mapIn(i) reads the right carrier.
+        let delta = estimate_offset_eti(&prs_spec_raw);
+        // SLICE-25 fix: integer-CFO via time-domain NCO for data symbols
+        // (matches eti-stuff `coarseCorrector` contribution to NCO).
+        // PRS keeps rotate-based correction since we need its FFT first
+        // to detect δ; PRS phase trajectory is rebased once we know δ via
+        // the cf32 stream's frame_nco continuation onto data symbols.
+        let nco_extra_hz = (delta as f64) * 1000.0;
 
         // Track best band ratio (post-rotation) just for the reporting line.
+        // PRS: keep the rotate_spectrum correction so the seed spectrum is
+        // at correct carrier alignment. Data symbols below use NCO time-
+        // domain integer correction instead.
         let prs_spec = rotate_spectrum(&prs_spec_raw, delta);
         let active_e: f64 =
             (1..=768).chain(1280..=2047).map(|i| p(&prs_spec[i])).sum();
@@ -274,9 +415,28 @@ pub fn process_iq_to_fic(
         let mut ok = true;
         for s in 1..=FIC_SYMBOLS {
             let cp_start = prs_start + s * TS;
-            let spec_raw =
-                fft_symbol_corrected(&resampled, cp_start, cfo_hz, &mut sfft, &mut frame_nco);
-            let spec = rotate_spectrum(&spec_raw, delta);
+            // SLICE-25: total CFO = fractional cfo_hz + integer δ·carrier_diff
+            // applied via time-domain NCO. No rotate_spectrum needed for data
+            // symbols because the NCO handles both fractional and integer.
+            let data_cfo = cfo_hz + nco_extra_hz;
+            let spec_raw = fft_symbol_corrected_with_dump(
+                &resampled, cp_start, data_cfo, &mut sfft, &mut frame_nco,
+                fft_input_fp.as_mut(),
+                (result.frames_decoded as u32) + 1, (s as u32) + 1);
+            let spec = spec_raw;
+            // SLICE-16: dump pre-differential FFT bins (eti-stuff fft_buffer match)
+            if let Some(fp) = fft_pre_fp.as_mut() {
+                let frame_idx = (result.frames_decoded as u32) + 1;
+                let ofdm_symbol_count = (s as u32) + 1; // dab-rs s ↔ eti-stuff count s+1
+                let _ = fp.write_all(&frame_idx.to_le_bytes());
+                let _ = fp.write_all(&ofdm_symbol_count.to_le_bytes());
+                let mut buf = Vec::with_capacity(2048 * 8);
+                for z in &spec {
+                    buf.extend_from_slice(&z.re.to_le_bytes());
+                    buf.extend_from_slice(&z.im.to_le_bytes());
+                }
+                let _ = fp.write_all(&buf);
+            }
             let diff = diff_ref.step(&spec);
             if diff_spec_fp.is_some() {
                 diff_specs_for_dump.push(diff.clone());
@@ -378,7 +538,8 @@ pub fn process_iq_to_fic(
 /// FFT one symbol with fractional-CFO removal — copy `TS` samples at
 /// `cp_start`, mix to cancel `cfo_hz`, FFT the useful part, return the
 /// 2048-bin natural-order spectrum.
-fn fft_symbol_corrected(
+#[allow(dead_code)]
+pub fn fft_symbol_corrected(
     resampled: &[Complex<f32>],
     cp_start: usize,
     cfo_hz: f64,
@@ -390,6 +551,44 @@ fn fft_symbol_corrected(
     sfft.fft_symbol(&region)
 }
 
+/// SLICE-20 instrumented variant: optionally dumps PRE/POST-NCO useful
+/// samples to `dump` with a (frame, sym, useful_start) header.
+fn fft_symbol_corrected_with_dump(
+    resampled: &[Complex<f32>],
+    cp_start: usize,
+    cfo_hz: f64,
+    sfft: &mut SymbolFft,
+    nco: &mut Nco,
+    mut dump: Option<&mut std::io::BufWriter<std::fs::File>>,
+    frame_idx: u32,
+    sym: u32,
+) -> Vec<Complex<f32>> {
+    const T_G: usize = 504;
+    const T_U: usize = 2048;
+    use std::io::Write;
+    let mut region = resampled[cp_start..cp_start + TS].to_vec();
+    let useful_start_u64 = (cp_start + T_G) as u64;
+    if let Some(fp) = dump.as_deref_mut() {
+        let _ = fp.write_all(&frame_idx.to_le_bytes());
+        let _ = fp.write_all(&sym.to_le_bytes());
+        let _ = fp.write_all(&useful_start_u64.to_le_bytes());
+        // pre-NCO useful samples
+        for z in &region[T_G..T_G + T_U] {
+            let _ = fp.write_all(&z.re.to_le_bytes());
+            let _ = fp.write_all(&z.im.to_le_bytes());
+        }
+    }
+    nco.mix(&mut region, -cfo_hz);
+    if let Some(fp) = dump.as_deref_mut() {
+        // post-NCO useful samples
+        for z in &region[T_G..T_G + T_U] {
+            let _ = fp.write_all(&z.re.to_le_bytes());
+            let _ = fp.write_all(&z.im.to_le_bytes());
+        }
+    }
+    sfft.fft_symbol(&region)
+}
+
 /// Rotate a natural-order spectrum by `delta` FFT bins to undo an integer
 /// carrier-frequency offset of `+delta` carriers (received carrier `k` lands
 /// at bin `k + delta`, so the corrected spectrum reads bin `i + delta` when
@@ -397,7 +596,7 @@ fn fft_symbol_corrected(
 ///
 /// Equivalent to `out[i] = spec[(i + delta) mod T_u]`. Returns a fresh vector
 /// to keep the function side-effect-free.
-fn rotate_spectrum(spec: &[Complex<f32>], delta: i32) -> Vec<Complex<f32>> {
+pub fn rotate_spectrum(spec: &[Complex<f32>], delta: i32) -> Vec<Complex<f32>> {
     let n = spec.len();
     if delta == 0 {
         return spec.to_vec();

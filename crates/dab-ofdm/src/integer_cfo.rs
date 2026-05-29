@@ -118,6 +118,66 @@ pub fn detect_integer_cfo(prs_spectrum: &[Complex<f32>], range: i32) -> IntegerC
     best
 }
 
+/// Adjacent-carrier phase-difference integer CFO estimator —
+/// `phaseReference::estimateOffset` from eti-stuff (`phasereference.cpp:114`)
+/// ported verbatim.
+///
+/// Searches `δ ∈ [−SEARCH_RANGE/2, SEARCH_RANGE/2)` (= [−35, 35)) and returns
+/// the δ that minimizes the L1 phase residual between received and reference
+/// adjacent-carrier differences. This estimator is **timing-invariant**:
+/// adjacent-carrier phase differences cancel any per-carrier phase ramp from
+/// sub-sample timing offsets, so it works correctly even when CP-autocorrelation
+/// fine-time picks a sample one off the true symbol start.
+///
+/// In contrast, [`detect_integer_cfo`] uses absolute magnitude correlation
+/// against the PRS reference table, which is sensitive to timing residuals.
+///
+/// # Convention
+///
+/// `δ > 0` means the received spectrum is shifted toward **higher** FFT bins.
+/// Apply the correction by rotating the spectrum left by δ bins
+/// (`rotate_spectrum`).
+pub fn estimate_offset_eti(prs_spectrum: &[Complex<f32>]) -> i32 {
+    const DIFF_LENGTH: usize = 50;
+    const SEARCH_RANGE_HALF: i32 = 35;
+
+    let t_u = prs_spectrum.len() as i32;
+    let ref_table = phase_reference();
+
+    // Reference adjacent-carrier phase differences around carrier 0
+    // (i.e. low positive carriers 1..51 of the ideal PRS).
+    // pd_ref[j] = ref[bin(j+1)] * conj(ref[bin(j+2)])
+    let phase_diffs: Vec<Complex<f32>> = (0..DIFF_LENGTH)
+        .map(|j| {
+            let j = j as i32;
+            let ind1 = ((t_u + j + 1).rem_euclid(t_u)) as usize;
+            let ind2 = ((t_u + j + 2).rem_euclid(t_u)) as usize;
+            ref_table[ind1] * ref_table[ind2].conj()
+        })
+        .collect();
+
+    let mut best_diff = f32::INFINITY;
+    let mut best_index = t_u; // default i = T_u → δ = 0
+
+    // Candidate i ∈ [T_u - 35, T_u + 35); returned δ = i − T_u ∈ [−35, 35).
+    for i in (t_u - SEARCH_RANGE_HALF)..(t_u + SEARCH_RANGE_HALF) {
+        let mut diff = 0.0_f32;
+        for j in 0..DIFF_LENGTH {
+            let j = j as i32;
+            let ind1 = ((i + j + 1).rem_euclid(t_u)) as usize;
+            let ind2 = ((i + j + 2).rem_euclid(t_u)) as usize;
+            let pd = prs_spectrum[ind1] * prs_spectrum[ind2].conj();
+            diff += (pd * phase_diffs[j as usize].conj()).arg().abs();
+        }
+        if diff < best_diff {
+            best_diff = diff;
+            best_index = i;
+        }
+    }
+
+    best_index - t_u
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

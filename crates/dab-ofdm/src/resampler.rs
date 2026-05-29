@@ -196,6 +196,81 @@ pub fn resample_3m_to_2048k(input: &[Complex<f32>]) -> Vec<Complex<f32>> {
     r.process(input)
 }
 
+/// Linear-interpolation resampler, verbatim port of eti-stuff's
+/// `airspy-handler.cpp` `data_available` (lines 157–162 + 358–376).
+///
+/// For each output sample `j` (in chunks of 2048), input position is
+/// `j · (selectedRate/1000) / 2048` with integer part `mapTable_int[j]` and
+/// fractional part `mapTable_float[j]`. Output is the linear blend of two
+/// adjacent input samples: `temp[j] = conv[base+1] · ratio + conv[base] ·
+/// (1 − ratio)`. After emitting 2048 samples, `conv[0]` carries the last
+/// input sample (`conv[convBufferSize]`) for the next block.
+///
+/// Streaming: buffer input until a full `convBufferSize + 1`-sample block
+/// is available, emit 2048 outputs, slide the buffer.
+pub struct LinearResampler {
+    /// Input samples per output block (= `selectedRate / 1000`).
+    conv_buffer_size: usize,
+    /// `mapTable_int[j]` for `j` in `[0, 2048)`.
+    map_table_int: Vec<usize>,
+    /// `mapTable_float[j]` for `j` in `[0, 2048)`.
+    map_table_float: Vec<f32>,
+    /// Pending input samples. We carry one trailing sample across blocks so
+    /// the first sample of the next block matches eti-stuff's
+    /// `conv[0] = conv[convBufferSize]`.
+    buffer: Vec<Complex<f32>>,
+}
+
+impl LinearResampler {
+    /// Build a linear-interpolation resampler from `input_rate_hz` to 2.048 MSPS.
+    /// Matches eti-stuff exactly for `input_rate_hz = 3_000_000`.
+    pub fn new(input_rate_hz: u32) -> Self {
+        // `selectedRate / 1000` in eti-stuff is integer division.
+        let conv_buffer_size = (input_rate_hz / 1000) as usize;
+        let in_val = (input_rate_hz / 1000) as f64; // verbatim: float(selectedRate/1000)
+        let mut map_table_int = vec![0usize; 2048];
+        let mut map_table_float = vec![0.0f32; 2048];
+        for i in 0..2048 {
+            let p = (i as f64) * in_val / 2048.0;
+            let base = p.floor() as usize;
+            map_table_int[i] = base;
+            map_table_float[i] = (p - base as f64) as f32;
+        }
+        LinearResampler {
+            conv_buffer_size,
+            map_table_int,
+            map_table_float,
+            buffer: Vec::with_capacity(conv_buffer_size + 1),
+        }
+    }
+
+    /// Streaming entry point. Appends `input` to the internal buffer and
+    /// emits as many 2048-sample blocks as fit; carries the last input
+    /// sample of each consumed block as `buffer[0]` for the next.
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<Complex<f32>> {
+        self.buffer.extend_from_slice(input);
+        let mut out = Vec::with_capacity(input.len() * 2048 / self.conv_buffer_size + 2);
+
+        // We need at least `conv_buffer_size + 1` samples to safely index
+        // `buffer[base + 1]` for `base in [0, conv_buffer_size)`.
+        while self.buffer.len() >= self.conv_buffer_size + 1 {
+            for j in 0..2048 {
+                let base = self.map_table_int[j];
+                let ratio = self.map_table_float[j];
+                let a = self.buffer[base];
+                let b = self.buffer[base + 1];
+                out.push(b * ratio + a * (1.0 - ratio));
+            }
+            // Slide: carry the trailing sample to position 0 (matches
+            // `convBuffer[0] = convBuffer[convBufferSize]`), drop the
+            // consumed `conv_buffer_size` samples.
+            self.buffer.drain(..self.conv_buffer_size);
+        }
+
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
