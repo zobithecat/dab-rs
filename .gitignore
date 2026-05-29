@@ -15,4 +15,11 @@ Cargo.lock.orig
 # OMC orchestration state / local agent config (not part of the public repo)
 .omc/
 .claude/
+.agents/
+.codex/
+AGENTS.md
 tasks.md
+
+# Python diagnostic cache
+__pycache__/
+*.pyc
