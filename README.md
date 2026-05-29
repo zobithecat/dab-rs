@@ -2,6 +2,16 @@
 
 **Memory-safe DAB Mode I OFDM demodulator and T-DMB receiver in pure Rust.**
 
+![YTN DMB video decoded by dab-rs from raw Airspy I/Q](docs/img/ytn_decoded_hero.png)
+
+> *YTN「뉴스특보」decoded **entirely by dab-rs** — raw Airspy Mini I/Q (3 MSPS
+> `int16`) → OFDM sync/CFO/FFT → FIC → MSC → 16-slot Forney time-deinterleave →
+> EEP → PRBS → RS(204,188) → MPEG-TS → H.264, then handed to ffmpeg for the final
+> picture. No fudge factors, no magic numbers — every constant traces to
+> `eti-stuff` or the DAB/DVB standards. The minor macroblock artifacts correspond
+> exactly to the 6.9% of RS(204,188) blocks that exceeded the t=8 correction
+> limit at this capture's SNR.*
+
 `dab-rs` is a reference-validated, from-scratch Rust implementation of a
 [DAB](https://en.wikipedia.org/wiki/Digital_Audio_Broadcasting) Mode I
 receiver, targeting **byte-identical output** with the C++

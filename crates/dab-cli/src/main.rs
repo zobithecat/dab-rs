@@ -48,6 +48,25 @@ enum Command {
         #[arg(long, default_value_t = 3_000_000)]
         rate: u32,
     },
+    /// Decode an MSC sub-channel from a raw I/Q capture: FIC → ensemble lookup
+    /// → 75-symbol demap → 16-CIF time deinterleaver → EepProtection +
+    /// descramble → Korean T-DMB outer FEC → MPEG-TS packets.
+    MscIq {
+        /// Path to a raw I/Q capture.
+        iq: PathBuf,
+        /// Sub-channel id to decode (e.g. `1` for SubCh 1 / mYTN on K8B).
+        #[arg(long, default_value_t = 1)]
+        scid: u8,
+        /// On-disk sample format.
+        #[arg(long, default_value = "cs16le")]
+        format: String,
+        /// On-disk sample rate (Hz).
+        #[arg(long, default_value_t = 3_000_000)]
+        rate: u32,
+        /// Optional MPEG-TS output path. If omitted, only stats are printed.
+        #[arg(long)]
+        ts: Option<PathBuf>,
+    },
     /// Resample a `Cs16Le @ 3 MSPS` capture to 2.048 MSPS and emit it in a
     /// format an eti-stuff offline input handler can consume.
     ///
@@ -140,6 +159,7 @@ fn main() -> Result<()> {
         Command::Fec { eti, subch } => run_fec(&eti, subch),
         Command::Fic { eti } => run_fic(&eti),
         Command::FicIq { iq, format, rate } => run_fic_iq(&iq, &format, rate),
+        Command::MscIq { iq, scid, format, rate, ts } => run_msc_iq(&iq, scid, &format, rate, ts.as_deref()),
         Command::ConvertIq { input, output, out } => run_convert_iq(&input, &output, &out),
         Command::DiagIbits { iq, oracle, frames, ingest } => {
             run_diag_ibits(&iq, &oracle, frames, &ingest)
@@ -260,6 +280,46 @@ fn run_convert_iq(
         label,
         output.display(),
     );
+    Ok(())
+}
+
+fn run_msc_iq(
+    iq: &std::path::Path,
+    scid: u8,
+    format: &str,
+    rate: u32,
+    ts_out: Option<&std::path::Path>,
+) -> Result<()> {
+    let fmt = match format.to_lowercase().as_str() {
+        "cs16le" => IqFormat::Cs16Le,
+        "cs8" => IqFormat::Cs8,
+        "cf32le" => IqFormat::Cf32Le,
+        other => anyhow::bail!("unsupported I/Q format: {other} (use cs16le / cs8 / cf32le)"),
+    };
+    let res = dab_cli::msc_iq::process_iq_to_msc(iq, fmt, rate, scid)?;
+    match &res.sub_channel {
+        Some(sc) => println!(
+            "scid {} {} start={}cu size={}cu {}kbps",
+            sc.sub_ch_id, sc.protection, sc.start_addr, sc.size_cu, sc.bitrate_kbps
+        ),
+        None => println!("scid {scid}: not found in ensemble"),
+    }
+    println!(
+        "frames_decoded={} cifs_assembled={} subch_bits={} subch_bytes={} ts_packets={}",
+        res.frames_decoded,
+        res.cifs_assembled,
+        res.subch_bits_total,
+        res.subch_bytes_total,
+        res.ts_packets.len()
+    );
+    if let Some(out) = ts_out {
+        let mut buf: Vec<u8> = Vec::with_capacity(res.ts_packets.len() * 188);
+        for pkt in &res.ts_packets {
+            buf.extend_from_slice(&pkt.data);
+        }
+        std::fs::write(out, &buf)?;
+        println!("wrote {} bytes ({} TS packets) → {}", buf.len(), res.ts_packets.len(), out.display());
+    }
     Ok(())
 }
 
